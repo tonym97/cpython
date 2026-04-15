@@ -23,6 +23,7 @@ from .gecko_collector import GeckoCollector
 from .jsonl_collector import JsonlCollector
 from .binary_collector import BinaryCollector
 from .binary_reader import BinaryReader
+from .telemetry.plugin_registry import resolve_helper_config
 from .constants import (
     MICROSECONDS_PER_SECOND,
     PROFILING_MODE_ALL,
@@ -168,6 +169,11 @@ def _build_child_profiler_args(args):
     mode = getattr(args, 'mode', 'wall')
     if mode != "wall":
         child_args.extend(["--mode", mode])
+
+    # Generic telemetry plugin options
+    child_plugins = getattr(args, "plugins", None) or []
+    for plugin_id in child_plugins:
+        child_args.extend(["--plugin", plugin_id])
 
     # Format options (skip pstats as it's the default)
     if args.format == "diff_flamegraph":
@@ -428,8 +434,13 @@ def _add_sampling_options(parser):
         "Uses thread_suspend on macOS and ptrace on Linux. Adds overhead but ensures memory "
         "reads are from a frozen state.",
     )
-
-
+    sampling_group.add_argument(
+        "--plugin",
+        dest="plugins",
+        action="append",
+        default=[],
+        help="Enable a telemetry plugin (repeatable)",
+    )
 def _add_mode_options(parser):
     """Add mode options to a parser."""
     mode_group = parser.add_argument_group("Mode options")
@@ -891,6 +902,10 @@ def _validate_args(args, parser):
     if command == "replay":
         return
 
+    # Deduplicate telemetry plugins while preserving order
+    if getattr(args, "plugins", None):
+        args.plugins = list(dict.fromkeys(args.plugins))
+
     # Check if live mode is available
     if hasattr(args, 'live') and args.live and LiveStatsCollector is None:
         parser.error(
@@ -970,6 +985,10 @@ def _validate_args(args, parser):
                 "Live mode uses a TUI interface with its own controls."
             )
         return
+
+    # Non-live GPU integration currently supports binary capture only.
+    if getattr(args, "plugins", None) and not args.live and getattr(args, "format", "pstats") != "binary":
+        parser.error("Telemetry plugins currently require --binary for non-live mode.")
 
     # Validate gecko mode doesn't use non-wall mode
     if args.format == "gecko" and getattr(args, 'mode', 'wall') != "wall":
@@ -1202,6 +1221,7 @@ def _handle_attach(args):
         diff_baseline=args.diff_baseline,
         capture_config=_capture_config_from_args(args),
     )
+    telemetry_plugins = _build_telemetry_plugins(args)
 
     with _get_child_monitor_context(args, args.pid):
         collector = sample(
@@ -1216,6 +1236,7 @@ def _handle_attach(args):
             gc=args.gc,
             opcodes=args.opcodes,
             blocking=args.blocking,
+            telemetry_plugins=telemetry_plugins,
         )
         _handle_output(collector, args, args.pid, mode)
 
@@ -1310,6 +1331,7 @@ def _handle_run(args):
         diff_baseline=args.diff_baseline,
         capture_config=_capture_config_from_args(args),
     )
+    telemetry_plugins = _build_telemetry_plugins(args)
 
     with _get_child_monitor_context(args, process.pid):
         try:
@@ -1325,6 +1347,7 @@ def _handle_run(args):
                 gc=args.gc,
                 opcodes=args.opcodes,
                 blocking=args.blocking,
+                telemetry_plugins=telemetry_plugins,
             )
             _handle_output(collector, args, process.pid, mode)
         finally:
@@ -1356,7 +1379,9 @@ def _handle_live_attach(args, pid):
         mode=mode,
         opcodes=args.opcodes,
         async_aware=args.async_mode if args.async_aware else None,
+        telemetry_plugin_ids=getattr(args, "plugins", []),
     )
+    telemetry_plugins = _build_telemetry_plugins(args)
 
     # Sample in live mode
     sample_live(
@@ -1371,6 +1396,7 @@ def _handle_live_attach(args, pid):
         gc=args.gc,
         opcodes=args.opcodes,
         blocking=args.blocking,
+        telemetry_plugins=telemetry_plugins,
     )
 
 
@@ -1403,7 +1429,9 @@ def _handle_live_run(args):
         mode=mode,
         opcodes=args.opcodes,
         async_aware=args.async_mode if args.async_aware else None,
+        telemetry_plugin_ids=getattr(args, "plugins", []),
     )
+    telemetry_plugins = _build_telemetry_plugins(args)
 
     # Profile the subprocess in live mode
     try:
@@ -1419,6 +1447,7 @@ def _handle_live_run(args):
             gc=args.gc,
             opcodes=args.opcodes,
             blocking=args.blocking,
+            telemetry_plugins=telemetry_plugins,
         )
     finally:
         # Clean up the subprocess and get any error output
@@ -1456,6 +1485,14 @@ def _handle_replay(args):
             _replay_with_reader(args, reader)
     except (OSError, ValueError) as exc:
         sys.exit(f"Error: {exc}")
+
+
+def _build_telemetry_plugins(args):
+    plugins = []
+    for plugin_id in getattr(args, "plugins", []) or []:
+        config = resolve_helper_config(plugin_id)
+        plugins.append({"id": plugin_id, "config": config})
+    return plugins or None
 
 
 if __name__ == "__main__":

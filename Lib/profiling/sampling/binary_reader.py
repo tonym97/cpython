@@ -7,6 +7,7 @@ from .stack_collector import FlamegraphCollector, CollapsedStackCollector
 from .jsonl_collector import JsonlCollector
 from .pstats_collector import PstatsCollector
 from .binary_collector import CAPTURE_FEATURES
+from .telemetry import replay_sidecar_to_sink
 
 
 class BinaryReader:
@@ -83,7 +84,9 @@ class BinaryReader:
         """
         if self._reader is None:
             raise RuntimeError("Reader not open. Use as context manager.")
-        return self._reader.replay(collector, progress_callback)
+        replayed = self._reader.replay(collector, progress_callback)
+        replay_sidecar_to_sink(self.filename, collector)
+        return replayed
 
     @property
     def sample_count(self):

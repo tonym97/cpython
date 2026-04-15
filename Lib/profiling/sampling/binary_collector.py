@@ -6,6 +6,7 @@ import time
 import _remote_debugging
 
 from .collector import Collector
+from .telemetry.chunks import TelemetryChunkWriter
 
 # Compression type constants (must match binary_io.h)
 COMPRESSION_NONE = 0
@@ -92,6 +93,21 @@ class BinaryCollector(Collector):
             mode=-1 if mode is None else mode,
             capture_features=encode_capture_config(capture_config),
         )
+        self._telemetry_chunk_writer = None
+
+    def set_plugin_enabled(self, plugin_id):
+        if plugin_id and self._telemetry_chunk_writer is None:
+            self._telemetry_chunk_writer = TelemetryChunkWriter(self.filename)
+
+    def set_plugin_metadata(self, plugin_id, metadata):
+        if self._telemetry_chunk_writer is None:
+            return
+        self._telemetry_chunk_writer.write_record(plugin_id, "metadata", metadata)
+
+    def collect_plugin_event(self, plugin_id, event_type, payload):
+        if self._telemetry_chunk_writer is None:
+            return
+        self._telemetry_chunk_writer.write_record(plugin_id, event_type, payload)
 
     def collect(self, stack_frames, timestamp_us=None):
         """Collect profiling data from stack frames.
@@ -136,6 +152,8 @@ class BinaryCollector(Collector):
             filename: Ignored (binary files are written incrementally)
         """
         self._writer.finalize()
+        if self._telemetry_chunk_writer is not None:
+            self._telemetry_chunk_writer.close()
         return True
 
     @property
@@ -156,4 +174,8 @@ class BinaryCollector(Collector):
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         """Finalize if the writer can still produce a valid file."""
-        return self._writer.__exit__(exc_type, exc_val, exc_tb)
+        try:
+            return self._writer.__exit__(exc_type, exc_val, exc_tb)
+        finally:
+            if self._telemetry_chunk_writer is not None:
+                self._telemetry_chunk_writer.close()
