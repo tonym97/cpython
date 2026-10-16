@@ -23,7 +23,7 @@ from .gecko_collector import GeckoCollector
 from .jsonl_collector import JsonlCollector
 from .binary_collector import BinaryCollector
 from .binary_reader import BinaryReader
-from .telemetry.plugin_registry import resolve_helper_config
+from .telemetry.plugin_registry import resolve_helper_config, resolve_target_environment, is_known_plugin
 from .constants import (
     MICROSECONDS_PER_SECOND,
     PROFILING_MODE_ALL,
@@ -267,8 +267,13 @@ def _wait_for_ready_signal(sync_sock, process, timeout):
         sel.close()
 
 
-def _run_with_sync(original_cmd, suppress_output=False):
-    """Run a command with socket-based synchronization and return the process."""
+def _run_with_sync(original_cmd, suppress_output=False, env=None):
+    """Run a command with socket-based synchronization and return the process.
+
+    ``env`` holds extra environment variables for the child (merged over the
+    current environment); telemetry plugins use it to switch on target-side
+    tracing.
+    """
     # Create a TCP socket for synchronization with better socket options
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sync_sock:
         # Set SO_REUSEADDR to avoid "Address already in use" errors
@@ -297,6 +302,8 @@ def _run_with_sync(original_cmd, suppress_output=False):
         # When suppress_output=False (normal mode), let stderr inherit so
         # script errors print to the terminal.
         popen_kwargs = {}
+        if env:
+            popen_kwargs["env"] = {**os.environ, **env}
         if suppress_output:
             popen_kwargs["stdin"] = subprocess.DEVNULL
             popen_kwargs["stdout"] = subprocess.DEVNULL
@@ -902,9 +909,14 @@ def _validate_args(args, parser):
     if command == "replay":
         return
 
-    # Deduplicate telemetry plugins while preserving order
+    # Deduplicate telemetry plugins while preserving order, and reject unknown ones early
     if getattr(args, "plugins", None):
         args.plugins = list(dict.fromkeys(args.plugins))
+        for plugin_id in args.plugins:
+            if not is_known_plugin(plugin_id):
+                from .telemetry.plugin_registry import list_plugin_ids
+                bundled = ", ".join(list_plugin_ids()) or "none"
+                parser.error(f"Unknown telemetry plugin {plugin_id!r} (bundled plugins: {bundled}; or give an importable dotted module path)")
 
     # Check if live mode is available
     if hasattr(args, 'live') and args.live and LiveStatsCollector is None:
@@ -1303,7 +1315,7 @@ def _handle_run(args):
 
     # Run with synchronization
     try:
-        process = _run_with_sync(cmd, suppress_output=False)
+        process = _run_with_sync(cmd, suppress_output=False, **_telemetry_popen_overrides(args))
     except RuntimeError as e:
         sys.exit(f"Error: {e}")
 
@@ -1410,7 +1422,7 @@ def _handle_live_run(args):
 
     # Run with synchronization, suppressing output for live mode
     try:
-        process = _run_with_sync(cmd, suppress_output=True)
+        process = _run_with_sync(cmd, suppress_output=True, **_telemetry_popen_overrides(args))
     except RuntimeError as e:
         sys.exit(f"Error: {e}")
 
@@ -1493,6 +1505,21 @@ def _build_telemetry_plugins(args):
         config = resolve_helper_config(plugin_id)
         plugins.append({"id": plugin_id, "config": config})
     return plugins or None
+
+
+def _telemetry_target_environment(args):
+    """Environment variables telemetry plugins want on a target started by ``run``."""
+    env = {}
+    for plugin_id in getattr(args, "plugins", []) or []:
+        config = resolve_helper_config(plugin_id)
+        env.update(resolve_target_environment(plugin_id, config))
+    return env
+
+
+def _telemetry_popen_overrides(args):
+    """Keyword overrides for ``_run_with_sync``; empty when no plugin needs any."""
+    env = _telemetry_target_environment(args)
+    return {"env": env} if env else {}
 
 
 if __name__ == "__main__":

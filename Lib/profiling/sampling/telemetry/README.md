@@ -1,245 +1,123 @@
 # Telemetry Plugin Architecture (`profiling.sampling`)
 
-This document describes the telemetry plugin system used by `profiling.sampling`,
-including live rendering, helper-process collection, binary sidecar persistence,
-and replay.
-
-It is intended for contributors adding or modifying telemetry plugins (for
-example GPU, CPU, runtime counters, system metrics).
-
----
-
-## Goals
-
-- Keep core sampling (`SampleProfiler`) independent from vendor/provider logic.
-- Collect telemetry out-of-process via helper subprocesses.
-- Persist plugin events alongside binary profile output.
-- Replay telemetry into collectors in a plugin-agnostic way.
-- Support multiple plugins in a single profiling run.
-- Allow adding new plugins by dropping modules into `telemetry/plugins/`.
+The telemetry plugin system lets external data sources render alongside the
+sampling profiler's CPU profile: live in the TUI, persisted next to binary
+captures, and replayed from them. The core sampler (`SampleProfiler`) knows
+nothing about any provider; plugins supply a helper process that emits events
+and a live adapter that renders them.
 
 ---
 
-## High-Level Flow
+## Flow
 
-1. CLI enables one or more plugins via `--plugin`.
-2. CLI builds telemetry plugin entries and resolves helper config.
-3. `SampleProfiler` creates one `TelemetryHelperManager` per plugin.
-4. Each manager launches `python -m profiling.sampling.telemetry --plugin ...`.
-5. Helper emits JSON lines (`plugin`, `event_type`, `payload`) over stdout.
-6. Profiler polls all managers and forwards events to collector via:
-   - `collect_plugin_event(plugin_id, event_type, payload)`
-7. In binary mode, `BinaryCollector` writes telemetry events to
-   `<binary>.telemetrychunks`.
-8. During replay, `replay_sidecar_to_sink()` reads sidecar records and routes
-   events back into the sink collector.
-9. In live mode, `LiveStatsCollector` instantiates live plugin adapters and
-   renders plugin panels in the TUI.
-
----
-
-## Key Modules
-
-- `telemetry/plugin_registry.py`
-  - Dynamic plugin discovery from `telemetry/plugins/`.
-  - Dispatches to plugin module hooks for:
-    - live plugin creation
-    - helper config resolution
-    - helper execution
-
-- `telemetry/helper.py`
-  - Generic helper-process entrypoint.
-  - Parses args, invokes registry dispatch, and emits JSON events.
-
-- `telemetry/manager.py`
-  - One manager per plugin helper process.
-  - Starts subprocess, polls non-blocking stdout lines, stops process.
-
-- `telemetry/chunks.py`
-  - Sidecar writer/reader (`.telemetrychunks`).
-  - Line-delimited JSON records with magic header.
-
-- `telemetry/replay.py`
-  - Replays sidecar data into sinks that implement plugin event API.
-
-- `telemetry/interfaces.py`
-  - Defines `LiveTelemetryPlugin` interface for TUI rendering adapters.
-
-- `telemetry/plugins/`
-  - Plugin modules (auto-discovered).
-  - Current example: `nvidia_gpu.py` (scaffold).
+1. The CLI enables plugins with repeatable `--plugin <id>`; `<id>` is a bundled
+   plugin name or an importable dotted module path.
+2. `SampleProfiler` creates one `TelemetryHelperManager` per plugin and passes
+   the plugin config, always including `target_pid`.
+3. The manager starts the plugin's helper: its native `helper_command` when it
+   has one, otherwise `python -m profiling.sampling.telemetry --plugin <id>`,
+   which runs the plugin's `run_helper`.
+4. The helper writes JSON lines `{"plugin", "event_type", "payload"}` on
+   stdout. A reader thread parses them into a bounded queue; the sampling loop
+   drains the queue after each sample without blocking.
+5. Events reach the collector through `collect_plugin_event(plugin_id,
+   event_type, payload)`.
+6. In live mode `LiveStatsCollector` routes events to the plugin's
+   `LiveTelemetryPlugin.ingest` and renders `render_lines` in the telemetry
+   panel. It also calls `observe_sample(stack_frames, timestamp_ns)` for every
+   CPU sample so a plugin can attribute its events to Python frames.
+7. In binary mode `BinaryCollector` appends events to
+   `<binary>.telemetrychunks`; `replay_sidecar_to_sink` reads them back for
+   sinks that implement the plugin event API.
+8. For `run`, the CLI merges each plugin's `target_environment` into the
+   target's environment before launching it.
 
 ---
 
-## Dynamic Plugin Discovery Contract
+## Modules
 
-`plugin_registry` scans `telemetry/plugins/` modules and registers those that
-declare `PLUGIN_ID`.
-
-A plugin module should define:
-
-- `PLUGIN_ID: str`
-- `create_live_plugin() -> LiveTelemetryPlugin | None`
-- `resolve_helper_config(config: dict | None) -> dict`
-- `run_helper(config: dict, emit: callable) -> None`
-
-Only `PLUGIN_ID` is required for discovery; missing hooks degrade gracefully:
-
-- Missing `create_live_plugin`: plugin not available in live panel.
-- Missing `resolve_helper_config`: config passes through unchanged.
-- Missing `run_helper`: helper emits metadata error note.
+- `plugin_registry.py`: plugin resolution (bundled directory scan by
+  `PLUGIN_ID`, then dotted-module import) and hook dispatch.
+- `manager.py`: one helper subprocess per plugin, reader threads, bounded event
+  queue, helper exit reported as a `health` event with the stderr tail.
+- `helper.py`: in-Python helper entrypoint; runs `run_helper` and exits.
+- `chunks.py`: sidecar writer/reader (`.telemetrychunks`, `TCHUNK1` header,
+  JSON lines).
+- `replay.py`: replays sidecar records into a sink.
+- `interfaces.py`: `LiveTelemetryPlugin`.
+- `plugins/`: bundled plugins, discovered by `PLUGIN_ID`.
 
 ---
 
-## Event Format
+## Plugin contract
 
-Helper emits line-delimited JSON objects:
+A plugin module defines `PLUGIN_ID` and any of these hooks:
 
-```json
-{
-  "plugin": "<plugin_id>",
-  "event_type": "<string>",
-  "payload": { "...": "plugin-defined" }
-}
-```
+| hook | purpose |
+|---|---|
+| `create_live_plugin(config=None) -> LiveTelemetryPlugin \| None` | live TUI adapter; receives the resolved helper config if it takes an argument |
+| `resolve_helper_config(config) -> dict` | fill helper config defaults |
+| `helper_command(config) -> list[str] \| None` | argv of a native helper speaking the event protocol |
+| `run_helper(config, emit)` | in-Python helper body; return when finished |
+| `target_environment(config) -> dict` | environment for targets started by `run` |
 
-Notes:
-- `event_type` semantics are plugin-specific.
-- `payload` schema is plugin-defined and versioned by plugin behavior.
+`LiveTelemetryPlugin`:
 
----
+- `panel_modes`: tuple of panel names cycled with `m`.
+- `ingest(event_type, payload)`.
+- `render_lines(mode, width)`: one entry per line, either a string or a list
+  of `(text, style)` segments. Styles map onto the TUI colour scheme so panels
+  match the CPU table: `header` and `sorted` (column headers), `good`, `warn`,
+  `hot` (green, yellow, red for values to watch), `cyan`, `magenta`, `func`,
+  `file`, `samples`, `trend_up`, `trend_down`, `bold`, `dim`, `normal`.
+  Unknown styles render normally. The TUI sets `plugin.trends_enabled` from
+  its `x` toggle before each render; `self.trend_style(key, metric, value,
+  fallback)` on the base class tracks a numeric cell across renders and
+  returns the trend style when it moved and trends are on, so any plugin
+  colours changes like the CPU table without its own bookkeeping.
+- `observe_sample(stack_frames, timestamp_ns)` (optional). `stack_frames` is
+  the unwinder result; each thread carries `thread_id` (the Linux tid) and
+  `frame_info`. `timestamp_ns` is `time.perf_counter_ns()`.
 
-## Multi-Plugin Behavior
-
-Multi-plugin runs are supported end-to-end:
-
-- One helper subprocess per plugin.
-- One shared sidecar writer that multiplexes all plugin records.
-- Records are demultiplexed by `plugin` field during replay.
-- Live UI keeps plugin runtimes in a map and can cycle plugin panels (`n` key).
-
-This is expected and intentional; a single sidecar stream stores all plugins.
-
----
-
-## CLI Integration
-
-- Enable plugins with repeatable `--plugin`:
-  - `--plugin nvidia_gpu`
-  - `--plugin nvidia_gpu --plugin another_plugin`
-
-- CLI does not hardcode provider details. It asks the registry to resolve helper
-  config for each plugin via `resolve_helper_config(plugin_id)`.
-
-### Plugin-specific CLI subflags
-
-Plugins can define their own flags for plugin-specific controls, such as:
-
-- `--nvidia-device`
-- `--nvidia-pm` / `--no-nvidia-pm`
-- `--nvidia-pc` / `--no-nvidia-pc`
-
-Recommended ownership model:
-
-- Plugin module defines:
-  - `register_cli_flags(parser)` to add plugin-specific args.
-  - `extract_cli_config(args)` to convert parsed args to plugin config overrides.
-- CLI remains generic:
-  - discovers plugins
-  - asks enabled plugins to register flags
-  - merges defaults from `resolve_helper_config(plugin_id)` with plugin overrides
-
-Status: this hook pattern is documented and recommended, but not yet implemented
-in the current CLI wiring.
-
-Current validation:
-- In non-live mode, telemetry plugins require `--binary` output.
+Event payload schemas are plugin-owned. Reserved `health` payload keys written
+by the framework: `helper` (`failed`, `exited`, `overflow`, `finished`,
+`error`), `returncode`, `stderr_tail`, `command`, `notes`.
 
 ---
 
-## Live UI Integration
+## Live UI
 
-`LiveStatsCollector` handles generic plugin rendering:
-
-- `set_plugin_enabled(plugin_id)` creates plugin runtime from registry.
-- `collect_plugin_event(...)` routes incoming events to plugin `ingest(...)`.
-- `TelemetryPanelWidget` renders current plugin/mode lines.
-- Panel controls:
-  - `g`: toggle telemetry panel
-  - `n`: cycle plugin
-  - `m`: cycle plugin mode
+- `g` toggles the telemetry panel, `n` cycles plugins, `m` cycles the current
+  plugin's panels.
+- The panel is `TELEMETRY_PANEL_HEIGHT` lines (title plus plugin lines).
 
 ---
 
-## Binary Persistence and Replay
+## CLI validation
 
-### Sidecar path
-
-For `profile.bin`, sidecar is:
-
-- `profile.bin.telemetrychunks`
-
-### Sidecar record
-
-Each line after magic header `TCHUNK1` is a compact JSON record with:
-- `plugin`
-- `event_type`
-- `payload`
-
-### Replay
-
-`replay_sidecar_to_sink(binary_filename, sink)`:
-- Reads sidecar records.
-- Calls `sink.set_plugin_enabled(plugin_id)` once per seen plugin (if present).
-- Calls `sink.collect_plugin_event(plugin_id, event_type, payload)` for each event.
+- Unknown plugin ids are rejected at argument parsing.
+- Without `--live`, plugins require `--binary` output.
 
 ---
 
-## Adding a New Plugin
+## Adding a plugin
 
-1. Create module in `telemetry/plugins/`, e.g. `my_plugin.py`.
-2. Add:
-   - `PLUGIN_ID = "my_plugin"`
-   - `create_live_plugin()`
-   - `resolve_helper_config(config)`
-   - `run_helper(config, emit)`
-   - optional: `register_cli_flags(parser)`
-   - optional: `extract_cli_config(args)`
-3. Implement a live adapter class extending `LiveTelemetryPlugin`:
-   - `ingest(event_type, payload)`
-   - `render_lines(mode, width)`
-4. Enable from CLI:
-   - `--plugin my_plugin`
-
-No `plugin_registry.py` edits are required when contract is followed.
+1. Create a module (bundled under `telemetry/plugins/`, or anywhere
+   importable) with `PLUGIN_ID` and the hooks above.
+2. Implement a `LiveTelemetryPlugin` subclass for the TUI.
+3. Enable it: `--plugin my_plugin` or `--plugin my_package.my_module`.
 
 ---
 
-## Current NVIDIA Plugin Status
+## Status register
 
-`telemetry/plugins/nvidia_gpu.py` is currently a scaffold:
-
-- Emits synthetic PM/PC events.
-- Includes helper config defaults (`provider/device/pm/pc`).
-- Live panel supports `pc` and `pm` modes.
-
-It is designed as a placeholder for real NVIDIA integration (for example CUPTI /
-NVPerf / Nsight-backed collection).
-
----
-
-## Known Constraints and Follow-Ups
-
-- Helper protocol is JSON lines over stdout (simple, portable, not binary-fast).
-- Sidecar payloads are untyped at framework level (plugin-owned schema).
-- No plugin capability negotiation yet (beyond graceful missing-hook handling).
-- Unknown plugin in helper emits metadata note and heartbeat loop continues.
-- Non-live plugin capture currently expects binary format.
-
-Potential future improvements:
-- Plugin metadata schema/versioning.
-- Optional plugin-specific CLI overrides.
-- Plugin capability introspection for UI and validation.
-- Robust helper health/failure reporting in collectors/UI.
-
-1q
+| Item | State | Owner |
+|---|---|---|
+| Helper lifecycle, reader thread, exit reporting | built | profiler |
+| Dotted-module plugin resolution | built | profiler |
+| Target environment injection for `run` | built | profiler |
+| Per-sample `observe_sample` hook | built | profiler |
+| Plugin-specific CLI flags (`register_cli_flags`, `extract_cli_config`) | not built; configure through `resolve_helper_config` | profiler |
+| Sidecar format | JSON lines; a binary chunk format is optional | profiler |
+| Replay of plugin events into non-live collectors | not built | profiler |
+| Non-live capture in formats other than binary | not built | profiler |

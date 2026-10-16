@@ -1,10 +1,15 @@
-"""Generic helper-process telemetry entrypoint."""
+"""Generic in-Python helper-process entrypoint.
+
+Used when a plugin has no native ``helper_command``. Runs the plugin's
+``run_helper`` and exits when it returns; the manager reports the exit to the
+collector as a ``health`` event.
+"""
 
 from __future__ import annotations
 
 import argparse
 import json
-import time
+import sys
 
 from .plugin_registry import run_helper_plugin
 
@@ -34,11 +39,14 @@ def main():
     except json.JSONDecodeError:
         config = {}
 
-    run_helper_plugin(args.plugin, config, _emit)
-    # Unknown plugins return immediately; keep helper alive with heartbeats.
-    while True:
-        _emit(args.plugin, "heartbeat", {"timestamp_us": int(time.monotonic() * 1_000_000)})
-        time.sleep(1.0)
+    try:
+        run_helper_plugin(args.plugin, config, _emit)
+    except KeyboardInterrupt:
+        pass
+    except Exception as exc:  # report, do not spin
+        _emit(args.plugin, "health", {"helper": "error", "notes": [f"{type(exc).__name__}: {exc}"]})
+        sys.exit(1)
+    _emit(args.plugin, "health", {"helper": "finished"})
 
 
 if __name__ == "__main__":

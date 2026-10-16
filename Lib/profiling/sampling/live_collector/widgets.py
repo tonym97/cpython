@@ -1084,16 +1084,78 @@ class OpcodePanel(Widget):
 
 
 class TelemetryPanelWidget(Widget):
-    """Widget for displaying current telemetry plugin panel."""
+    """Widget for displaying the current telemetry plugin panel.
+
+    A plugin's ``render_lines`` returns one entry per line: either a plain
+    string, or a list of ``(text, style)`` segments. Style names map onto the
+    TUI's colour scheme so plugin panels look like the CPU table:
+
+    ``header``     column header (reverse video, like the CPU table header)
+    ``sorted``     the header cell of the sort column
+    ``bold``, ``dim``, ``normal``
+    ``good``, ``warn``, ``hot``   green / yellow / red, for values to watch
+    ``cyan``, ``magenta``
+    ``func``, ``file``            the CPU table's function and file:line colours
+    ``samples``                   the CPU table's sample-count colour
+    ``trend_up``, ``trend_down``  the CPU table's trend colours
+
+    Before rendering, the widget sets ``plugin.trends_enabled`` from the TUI's
+    trend toggle (``x``) so a plugin can colour changing values the same way
+    the CPU table does.
+    """
 
     def __init__(self, display, colors, collector):
         super().__init__(display, colors)
         self.collector = collector
 
-    def render(self, line, width, **kwargs):
+    def _style_attr(self, style):
         A_BOLD = self.display.get_attr("A_BOLD")
         A_DIM = self.display.get_attr("A_DIM")
         A_NORMAL = self.display.get_attr("A_NORMAL")
+        colors = self.colors
+        table = {
+            "header": colors.get("normal_header", A_BOLD),
+            "sorted": colors.get("sorted_header", A_BOLD),
+            "bold": A_BOLD,
+            "dim": A_DIM,
+            "normal": A_NORMAL,
+            "good": colors.get("green", A_BOLD),
+            "warn": colors.get("yellow", A_BOLD),
+            "hot": colors.get("red", A_BOLD),
+            "cyan": colors.get("cyan", A_BOLD),
+            "magenta": colors.get("magenta", A_BOLD),
+            "func": colors.get("color_func", A_NORMAL),
+            "file": colors.get("color_file", A_NORMAL),
+            "samples": colors.get("color_samples", A_NORMAL),
+            "trend_up": colors.get("trend_up", A_BOLD),
+            "trend_down": colors.get("trend_down", A_BOLD),
+        }
+        return table.get(style, A_NORMAL)
+
+    def _draw_line(self, line, width, panel_line):
+        A_BOLD = self.display.get_attr("A_BOLD")
+        A_DIM = self.display.get_attr("A_DIM")
+        A_NORMAL = self.display.get_attr("A_NORMAL")
+        if isinstance(panel_line, str):
+            attr = A_DIM if not panel_line else (A_BOLD if panel_line.endswith(":") else A_NORMAL)
+            self.add_str(line, 0, panel_line[: width - 1], attr)
+            return
+        col = 0
+        is_header = any(style in ("header", "sorted") for _, style in panel_line)
+        for text, style in panel_line:
+            text = str(text)
+            if col >= width - 1:
+                break
+            text = text[: width - 1 - col]
+            self.add_str(line, col, text, self._style_attr(style))
+            col += len(text)
+        if is_header and col < width - 1:
+            # Extend the header background across the panel like the CPU table.
+            self.add_str(line, col, " " * (width - 1 - col), self._style_attr("header"))
+
+    def render(self, line, width, **kwargs):
+        A_BOLD = self.display.get_attr("A_BOLD")
+        A_DIM = self.display.get_attr("A_DIM")
         plugin_id, plugin = self.collector._get_current_telemetry_plugin()
         if plugin is None:
             self.add_str(line, 0, "No telemetry plugins active.", A_DIM)
@@ -1107,9 +1169,13 @@ class TelemetryPanelWidget(Widget):
         self.add_str(line, 0, title[: width - 1], self.colors.get("magenta", A_BOLD) | A_BOLD)
         line += 1
 
+        tracker = getattr(self.collector, "_trend_tracker", None)
+        plugin.trends_enabled = bool(tracker is not None and tracker.enabled)
         for panel_line in plugin.render_lines(mode, width)[: TELEMETRY_PANEL_HEIGHT - 1]:
-            attr = A_DIM if not panel_line else (A_BOLD if str(panel_line).endswith(":") else A_NORMAL)
-            self.add_str(line, 0, str(panel_line)[: width - 1], attr)
+            try:
+                self._draw_line(line, width, panel_line)
+            except Exception:
+                self.add_str(line, 0, str(panel_line)[: width - 1], A_DIM)
             line += 1
 
         return line

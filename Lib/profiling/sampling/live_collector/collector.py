@@ -176,6 +176,7 @@ class LiveStatsCollector(Collector):
         # Opcode statistics: {location: {opcode: count}}
         self.opcode_stats = collections.defaultdict(lambda: collections.defaultdict(int))
         self.show_opcodes = opcodes  # Show opcode panel when --opcodes flag is passed
+        self.accepts_sample_timestamp = True  # sampler passes unwind-start time to collect()
         self.show_telemetry_panel = bool(telemetry_plugin_ids)
         self.telemetry_plugins = {}  # plugin_id -> plugin runtime
         self.telemetry_plugin_order = []
@@ -405,6 +406,14 @@ class LiveStatsCollector(Collector):
             if thread_id is not None:
                 thread_data = self._get_or_create_thread_data(thread_id)
                 thread_data.sample_count += 1
+
+        if self.telemetry_plugins:
+            # timestamp_us is the sampler's perf_counter time at unwind start.
+            now_ns = timestamp_us * 1000 if timestamp_us is not None else time.perf_counter_ns()
+            for plugin in self.telemetry_plugins.values():
+                observe = getattr(plugin, "observe_sample", None)
+                if observe is not None:
+                    observe(stack_frames, now_ns)
 
         if has_gc_frame:
             self.gc_frame_samples += 1

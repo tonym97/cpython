@@ -47,7 +47,7 @@ FINISHED_BANNER_EXTRA_LINES = 3  # Blank line + banner + blank line
 
 # Panel display
 OPCODE_PANEL_HEIGHT = 12  # Height reserved for opcode statistics panel
-TELEMETRY_PANEL_HEIGHT = 10  # Height reserved for telemetry plugin panel
+TELEMETRY_PANEL_HEIGHT = 12  # Height reserved for telemetry plugin panel
 
 # Color pair IDs
 COLOR_PAIR_SAMPLES = 1

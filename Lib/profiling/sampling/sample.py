@@ -99,7 +99,8 @@ class SampleProfiler:
         if telemetry_plugins and TelemetryHelperManager is not None:
             for plugin in telemetry_plugins:
                 plugin_id = plugin.get("id")
-                plugin_config = plugin.get("config", {})
+                plugin_config = dict(plugin.get("config") or {})
+                plugin_config.setdefault("target_pid", self.pid)
                 if plugin_id:
                     self.telemetry_managers.append(
                         TelemetryHelperManager(plugin_id, plugin_config)
@@ -190,6 +191,11 @@ class SampleProfiler:
                             pending_timestamps.append(current_time_us)
                             if pending_count >= MAX_PENDING_SAMPLES:
                                 flush_pending()
+                        elif getattr(collector, "accepts_sample_timestamp", False) is True:
+                            # Live collectors stamp the sample with the time the
+                            # unwind started so telemetry attribution is not
+                            # skewed by unwind latency.
+                            collector.collect(stack_frames, timestamp_us=current_time_us)
                         else:
                             collector.collect(stack_frames)
 
