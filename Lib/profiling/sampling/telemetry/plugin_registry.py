@@ -1,184 +1,114 @@
-"""Telemetry plugin registry and dispatch.
+"""Telemetry plugin lookup.
 
-A plugin is a module that declares ``PLUGIN_ID``. Plugins are found in two
-ways:
+A plugin is named on the command line with ``--plugin <id>``. The id is
+either a bundled plugin, discovered under ``profiling.sampling.telemetry
+.plugins`` by its ``plugin_id``, or the dotted path of any importable module
+(``--plugin my_company.tachyon_plugin``). A module provides its plugin as a
+``TelemetryPlugin`` subclass named ``PLUGIN``; a module that instead defines
+``PLUGIN_ID`` and module-level hook functions is wrapped by
+``ModuleHookPlugin``.
 
-* bundled modules under ``profiling.sampling.telemetry.plugins`` are
-  discovered by their ``PLUGIN_ID`` (``--plugin my_plugin``);
-* any importable module can be named by dotted path
-  (``--plugin my_company.tachyon_plugin``). Its ``PLUGIN_ID`` is used if
-  present, otherwise the dotted path itself.
-
-Optional module hooks, all looked up by name:
-
-``create_live_plugin(config=None) -> LiveTelemetryPlugin | None``
-    Live TUI adapter. If the factory accepts an argument it receives the
-    resolved helper config, so panel settings can live beside helper settings.
-``resolve_helper_config(config: dict | None) -> dict``
-    Fill in defaults for the helper configuration. The profiler always adds
-    ``target_pid`` before a helper is started.
-``helper_command(config: dict) -> list[str] | None``
-    Argv for a native helper process that speaks the JSON-lines event
-    protocol on stdout. When absent or ``None`` the helper is
-    ``python -m profiling.sampling.telemetry --plugin <id>``, which calls
-    ``run_helper``.
-``run_helper(config: dict, emit) -> None``
-    In-Python helper body; return when done.
-``target_environment(config: dict) -> dict[str, str]``
-    Environment variables to set on a target launched by ``run``.
-``register_cli_flags(parser)``
-    Add plugin-specific command line options to the ``run`` and ``attach``
-    parsers; called only for plugins named with ``--plugin`` on the command
-    line, so a plugin's options exist exactly when the plugin is enabled.
-``extract_cli_config(args) -> dict``
-    Turn parsed plugin options into helper config overrides, merged over
-    ``resolve_helper_config``.
-``summarize_records(records) -> list[str] | None``
-    Text summary of this plugin's events for outputs with no live panel
-    (non-binary capture formats and ``replay``). ``records`` are
-    ``(plugin_id, event_type, payload)`` tuples.
+Naming a dotted module imports and runs it, like ``python -m``; only use
+plugins from sources you trust.
 """
 
-from __future__ import annotations
-
 import importlib
+import json
 import pkgutil
+import sys
 
 from . import plugins as plugins_pkg
+from .plugin import ModuleHookPlugin, TelemetryPlugin
+
+_BUNDLED = None
+_EXTERNAL = {}
 
 
-_PLUGIN_MODULES = None
-_EXTERNAL_MODULES = {}
+def _plugin_class_from_module(module, fallback_id):
+    plugin_class = getattr(module, "PLUGIN", None)
+    if isinstance(plugin_class, type) and issubclass(plugin_class, TelemetryPlugin):
+        if not plugin_class.plugin_id:
+            plugin_class.plugin_id = fallback_id
+        return plugin_class
+    plugin_id = getattr(module, "PLUGIN_ID", None)
+    if plugin_id:
+        return ModuleHookPlugin.for_module(module, plugin_id)
+    return None
 
 
-def _discover_plugin_modules():
-    modules = {}
+def _discover_bundled():
+    found = {}
     for module_info in pkgutil.iter_modules(plugins_pkg.__path__):
-        name = module_info.name
-        if name.startswith("_"):
+        if module_info.name.startswith("_"):
             continue
         try:
-            module = importlib.import_module(f"{plugins_pkg.__name__}.{name}")
+            module = importlib.import_module(f"{plugins_pkg.__name__}.{module_info.name}")
         except Exception:
             continue
-        plugin_id = getattr(module, "PLUGIN_ID", None)
-        if plugin_id:
-            modules[plugin_id] = module
-    return modules
+        plugin_class = _plugin_class_from_module(module, module_info.name)
+        if plugin_class is not None:
+            found[plugin_class.plugin_id] = plugin_class
+    return found
 
 
-def _get_plugin_modules():
-    global _PLUGIN_MODULES
-    if _PLUGIN_MODULES is None:
-        _PLUGIN_MODULES = _discover_plugin_modules()
-    return _PLUGIN_MODULES
+def _bundled():
+    global _BUNDLED
+    if _BUNDLED is None:
+        _BUNDLED = _discover_bundled()
+    return _BUNDLED
 
 
-def _get_plugin_module(plugin_id):
+def get_plugin_class(plugin_id):
+    """The ``TelemetryPlugin`` subclass for ``plugin_id``, or ``None``."""
     if not plugin_id:
         return None
-    module = _get_plugin_modules().get(plugin_id)
-    if module is not None:
-        return module
-    module = _EXTERNAL_MODULES.get(plugin_id)
-    if module is not None:
-        return module
-    if "." in plugin_id:
-        try:
-            module = importlib.import_module(plugin_id)
-        except ImportError:
-            return None
-        _EXTERNAL_MODULES[plugin_id] = module
-        return module
-    return None
+    plugin_class = _bundled().get(plugin_id) or _EXTERNAL.get(plugin_id)
+    if plugin_class is not None:
+        return plugin_class
+    if "." not in plugin_id:
+        return None
+    try:
+        module = importlib.import_module(plugin_id)
+    except ImportError:
+        return None
+    plugin_class = _plugin_class_from_module(module, plugin_id)
+    if plugin_class is not None:
+        _EXTERNAL[plugin_id] = plugin_class
+    return plugin_class
 
 
 def is_known_plugin(plugin_id):
-    return _get_plugin_module(plugin_id) is not None
+    return get_plugin_class(plugin_id) is not None
 
 
 def list_plugin_ids():
-    return sorted(_get_plugin_modules())
+    """Ids of the bundled plugins."""
+    return sorted(_bundled())
 
 
-def create_live_plugin(plugin_id):
-    module = _get_plugin_module(plugin_id)
-    if module is None:
+def make_plugin(plugin_id, overrides=None):
+    """Instantiate ``plugin_id`` with its resolved config, or return ``None``."""
+    plugin_class = get_plugin_class(plugin_id)
+    if plugin_class is None:
         return None
-    factory = getattr(module, "create_live_plugin", None)
-    if callable(factory):
-        try:
-            plugin = factory(resolve_helper_config(plugin_id))
-        except TypeError:
-            plugin = factory()
-        if plugin is not None and getattr(plugin, "plugin_id", None) in (None, "base"):
-            plugin.plugin_id = plugin_id
-        return plugin
-    return None
+    return plugin_class(plugin_class.resolve_config(overrides))
 
 
-def resolve_helper_config(plugin_id, config=None):
-    module = _get_plugin_module(plugin_id)
-    if module is None:
-        return dict(config or {})
-    resolver = getattr(module, "resolve_helper_config", None)
-    if callable(resolver):
-        return resolver(config)
-    return dict(config or {})
+def helper_command(plugin):
+    """Argv for the plugin's helper process.
 
-
-def resolve_helper_command(plugin_id, config):
-    module = _get_plugin_module(plugin_id)
-    if module is None:
-        return None
-    hook = getattr(module, "helper_command", None)
-    if callable(hook):
-        return hook(config)
-    return None
-
-
-def resolve_target_environment(plugin_id, config):
-    module = _get_plugin_module(plugin_id)
-    if module is None:
-        return {}
-    hook = getattr(module, "target_environment", None)
-    if callable(hook):
-        return dict(hook(config) or {})
-    return {}
-
-
-def register_cli_flags(plugin_id, parser):
-    module = _get_plugin_module(plugin_id)
-    hook = getattr(module, "register_cli_flags", None) if module else None
-    if callable(hook):
-        hook(parser)
-        return True
-    return False
-
-
-def extract_cli_config(plugin_id, args):
-    module = _get_plugin_module(plugin_id)
-    hook = getattr(module, "extract_cli_config", None) if module else None
-    if callable(hook):
-        return dict(hook(args) or {})
-    return {}
-
-
-def summarize_records(plugin_id, records):
-    module = _get_plugin_module(plugin_id)
-    hook = getattr(module, "summarize_records", None) if module else None
-    if callable(hook):
-        return hook(records)
-    return None
-
-
-def run_helper_plugin(plugin_id, config, emit):
-    module = _get_plugin_module(plugin_id)
-    if module is None:
-        emit(plugin_id, "health", {"helper": "error", "notes": ["unknown plugin"]})
-        return
-    runner = getattr(module, "run_helper", None)
-    if callable(runner):
-        runner(config, emit)
-        return
-    emit(plugin_id, "health", {"helper": "error", "notes": ["plugin has no run_helper and no helper_command"]})
+    The plugin's own ``helper_command`` when it has one; otherwise a Python
+    helper process that runs the plugin's ``run_helper``.
+    """
+    command = plugin.helper_command()
+    if command:
+        return list(command)
+    return [
+        sys.executable,
+        "-m",
+        "profiling.sampling.telemetry",
+        "--plugin",
+        plugin.plugin_id,
+        "--config-json",
+        json.dumps(plugin.config, separators=(",", ":"), default=str),
+    ]

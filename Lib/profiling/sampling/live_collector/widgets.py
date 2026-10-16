@@ -1086,9 +1086,9 @@ class OpcodePanel(Widget):
 class TelemetryPanelWidget(Widget):
     """Widget for displaying the current telemetry plugin panel.
 
-    A plugin's ``render_lines`` returns one entry per line: either a plain
-    string, or a list of ``(text, style)`` segments. Style names map onto the
-    TUI's colour scheme so plugin panels look like the CPU table:
+    A panel's ``render_lines`` returns one entry per line: either a plain
+    string, or a list of ``Segment`` (``(text, style)``). Style names map onto
+    the TUI's colour scheme so plugin panels look like the CPU table:
 
     ``header``     column header (reverse video, like the CPU table header)
     ``sorted``     the header cell of the sort column
@@ -1099,9 +1099,9 @@ class TelemetryPanelWidget(Widget):
     ``samples``                   the CPU table's sample-count colour
     ``trend_up``, ``trend_down``  the CPU table's trend colours
 
-    Before rendering, the widget sets ``plugin.trends_enabled`` from the TUI's
-    trend toggle (``x``) so a plugin can colour changing values the same way
-    the CPU table does.
+    Before rendering, the widget passes the TUI's trend toggle (``x``) to the
+    panel through ``set_trends_enabled`` so it can colour changing values the
+    same way the CPU table does.
     """
 
     def __init__(self, display, colors, collector):
@@ -1156,12 +1156,12 @@ class TelemetryPanelWidget(Widget):
     def render(self, line, width, **kwargs):
         A_BOLD = self.display.get_attr("A_BOLD")
         A_DIM = self.display.get_attr("A_DIM")
-        plugin_id, plugin = self.collector._get_current_telemetry_plugin()
-        if plugin is None:
+        plugin_id, panel = self.collector._get_current_telemetry_plugin()
+        if panel is None:
             self.add_str(line, 0, "No telemetry plugins active.", A_DIM)
             return line + 1
 
-        modes = list(getattr(plugin, "panel_modes", ("default",)))
+        modes = list(panel.panel_modes) or ["default"]
         mode_idx = self.collector.current_telemetry_mode_idx % len(modes)
         mode = modes[mode_idx]
         title = f"─── Telemetry [{plugin_id}] ({mode.upper()}) "
@@ -1170,8 +1170,8 @@ class TelemetryPanelWidget(Widget):
         line += 1
 
         tracker = getattr(self.collector, "_trend_tracker", None)
-        plugin.trends_enabled = bool(tracker is not None and tracker.enabled)
-        for panel_line in plugin.render_lines(mode, width)[: TELEMETRY_PANEL_HEIGHT - 1]:
+        panel.set_trends_enabled(tracker is not None and tracker.enabled)
+        for panel_line in panel.render_lines(mode, width)[: TELEMETRY_PANEL_HEIGHT - 1]:
             try:
                 self._draw_line(line, width, panel_line)
             except Exception:

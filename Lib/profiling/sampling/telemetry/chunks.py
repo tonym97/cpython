@@ -1,6 +1,8 @@
-"""Plugin telemetry chunk sidecar read/write helpers."""
+"""Sidecar file for plugin events captured alongside a binary profile.
 
-from __future__ import annotations
+``<binary>.telemetrychunks`` holds a magic header line followed by one JSON
+record per line: ``{"plugin": id, "event_type": str, "payload": {...}}``.
+"""
 
 import json
 import os

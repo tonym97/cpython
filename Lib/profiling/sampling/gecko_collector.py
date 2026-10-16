@@ -9,6 +9,9 @@ import threading
 import time
 
 from .collector import Collector, filter_internal_frames
+from .telemetry.gecko import TelemetryClock
+from .telemetry.plugin_registry import make_plugin
+from .telemetry.records import TelemetryRecordBuffer
 from .opcode_utils import get_opcode_info, format_opcode
 try:
     from _remote_debugging import THREAD_STATUS_HAS_GIL, THREAD_STATUS_ON_CPU, THREAD_STATUS_UNKNOWN, THREAD_STATUS_GIL_REQUESTED, THREAD_STATUS_HAS_EXCEPTION, THREAD_STATUS_MAIN_THREAD
@@ -33,6 +36,7 @@ GECKO_CATEGORIES = [
     {"name": "Code Type", "color": "red", "subcategories": ["Other"]},
     {"name": "Opcodes", "color": "magenta", "subcategories": ["Other"]},
     {"name": "Exception", "color": "lightblue", "subcategories": ["Other"]},
+    {"name": "Telemetry", "color": "grey", "subcategories": ["Other"]},
 ]
 
 # Category indices
@@ -45,6 +49,24 @@ CATEGORY_CPU = 5
 CATEGORY_CODE_TYPE = 6
 CATEGORY_OPCODES = 7
 CATEGORY_EXCEPTION = 8
+CATEGORY_TELEMETRY = 9
+
+# Firefox Profiler accepts only these graph colours and marker field formats;
+# anything else makes it reject the whole profile.
+GECKO_GRAPH_COLORS = frozenset({"blue", "green", "grey", "ink", "magenta", "orange", "purple", "red", "teal", "yellow"})
+GECKO_FIELD_FORMATS = frozenset({
+    "url", "file-path", "sanitized-string", "string", "unique-string", "duration", "time", "seconds",
+    "milliseconds", "microseconds", "nanoseconds", "bytes", "percentage", "integer", "decimal",
+    "flow-id", "terminating-flow-id", "list", "pid", "tid",
+})
+
+
+def _graph_color(color):
+    return color if color in GECKO_GRAPH_COLORS else "grey"
+
+
+def _field_format(fmt):
+    return fmt if fmt in GECKO_FIELD_FORMATS else "string"
 
 # Subcategory indices
 DEFAULT_SUBCATEGORY = 0
@@ -183,6 +205,111 @@ class GeckoCollector(Collector):
 
         # For binary replay: track base timestamp (first sample's timestamp)
         self._replay_base_timestamp_us = None
+
+        # Telemetry plugin events, rendered at export as extra tracks, markers
+        # and graphs (see telemetry/gecko.py). The clock pair lets a live
+        # capture convert the plugins' wall-clock times to profile time.
+        self._telemetry = TelemetryRecordBuffer()
+        self._telemetry_clock_pair = (time.time_ns(), time.monotonic_ns())
+        self._telemetry_schemas = []
+        self._next_track_tid = 10_000_000  # synthetic tids for marker-only tracks
+
+    # ---- telemetry plugin event API -----------------------------------------
+
+    accepts_plugin_events = True
+
+    def set_plugin_enabled(self, plugin_id):
+        self._telemetry.set_plugin_enabled(plugin_id)
+
+    def set_plugin_metadata(self, plugin_id, metadata):
+        self._telemetry.set_plugin_metadata(plugin_id, metadata)
+
+    def collect_plugin_event(self, plugin_id, event_type, payload):
+        self._telemetry.collect_plugin_event(plugin_id, event_type, payload)
+
+    def _telemetry_base_us(self):
+        if self._replay_base_timestamp_us is not None:
+            return self._replay_base_timestamp_us
+        return self.start_time * 1000.0  # start_time is monotonic ms
+
+    def _new_track_thread(self, name, process_name):
+        tid = self._next_track_tid
+        self._next_track_tid += 1
+        thread = self._create_thread(tid, False)
+        thread["name"] = name
+        thread["processName"] = process_name
+        self.threads[tid] = thread
+        return tid
+
+    def _append_marker(self, tid, name, start_ms, end_ms, data):
+        """Interval marker when ``end_ms`` is set, else instant (endTime null)."""
+        if start_ms is None:
+            return
+        data = dict(data or {})
+        data.setdefault("type", name.replace(" ", ""))
+        phase = 1 if end_ms is not None else 0
+        self.threads[tid]["_spill"].append_marker(
+            self._intern_string(name), start_ms, end_ms, phase, CATEGORY_TELEMETRY, data
+        )
+
+    def _add_schema(self, schema):
+        """Keep a plugin marker schema with formats and colours the profiler accepts."""
+        schema = dict(schema)
+        schema["fields"] = [
+            dict(f, format=_field_format(f.get("format"))) for f in schema.get("fields", [])
+        ]
+        if "graphs" in schema:
+            schema["graphs"] = [
+                dict(g, color=_graph_color(g.get("color"))) for g in schema["graphs"]
+            ]
+        self._telemetry_schemas.append(schema)
+
+    def _add_telemetry_contributions(self):
+        """Turn each plugin's GeckoContribution into threads, markers and schemas."""
+        for plugin_id, records in self._telemetry.by_plugin().items():
+            if not records:
+                continue
+            clock = TelemetryClock.from_records(
+                self._telemetry_base_us(), records, self._telemetry_clock_pair)
+            plugin = make_plugin(plugin_id)
+            if clock is None or plugin is None:
+                continue
+            contribution = plugin.gecko_contribution(records, clock)
+            if contribution is None or contribution.is_empty():
+                continue
+            for schema in contribution.marker_schemas:
+                self._add_schema(schema)
+            for track in contribution.tracks:
+                tid = self._new_track_thread(track.name, track.process_name)
+                for marker in track.markers:
+                    self._append_marker(tid, marker.name, marker.start_ms, marker.end_ms, marker.data)
+            fallback_tid = None
+            for marker in contribution.thread_markers:
+                tid = marker.tid
+                if tid not in self.threads:
+                    # Not a sampled thread: collect on a per-plugin fallback track.
+                    if fallback_tid is None:
+                        fallback_tid = self._new_track_thread(
+                            f"{plugin_id} (other threads)", "Telemetry")
+                    tid = fallback_tid
+                self._append_marker(tid, marker.name, marker.start_ms, marker.end_ms, marker.data)
+            for graph in contribution.graphs:
+                tid = self._new_track_thread(graph.name, graph.process_name)
+                schema_name = graph.schema_name or graph.name.replace(" ", "")
+                for point in graph.points:
+                    data = {"type": schema_name, **point.values}
+                    self._append_marker(tid, graph.name, point.start_ms, point.end_ms, data)
+                # Graph points are drawn in the track itself; keep them out of
+                # the marker chart and table so they do not bury real markers.
+                self._add_schema({
+                    "name": schema_name,
+                    "display": [],
+                    "tooltipLabel": graph.name,
+                    "graphs": [{"key": s.key, "type": "line", "color": s.color}
+                               for s in graph.series],
+                    "fields": [{"key": s.key, "label": s.label or s.key, "format": s.format}
+                               for s in graph.series],
+                })
 
     def _track_state_transition(self, tid, condition, active_dict, inactive_dict,
                                   active_name, inactive_name, category, current_time):
@@ -806,6 +933,11 @@ class GeckoCollector(Collector):
                 ],
             })
 
+        seen = {s["name"] for s in schema}
+        for entry in self._telemetry_schemas:
+            if entry["name"] not in seen:
+                schema.append(entry)
+                seen.add(entry["name"])
         return schema
 
     def _build_profile(self):
@@ -865,6 +997,7 @@ class GeckoCollector(Collector):
         if self.exported:
             raise RuntimeError("GeckoCollector has already been exported")
         self._finalize_markers()
+        self._add_telemetry_contributions()
         for thread_data in self.threads.values():
             thread_data["_spill"].prepare_read()
             thread_data["stackTable"]["length"] = len(thread_data["stackTable"]["frame"])

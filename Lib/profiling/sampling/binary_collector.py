@@ -95,6 +95,8 @@ class BinaryCollector(Collector):
         )
         self._telemetry_chunk_writer = None
 
+    accepts_plugin_events = True
+
     def set_plugin_enabled(self, plugin_id):
         if plugin_id and self._telemetry_chunk_writer is None:
             self._telemetry_chunk_writer = TelemetryChunkWriter(self.filename)

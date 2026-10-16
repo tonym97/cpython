@@ -45,7 +45,7 @@ from .constants import (
 from .display import CursesDisplay
 from .widgets import HeaderWidget, TableWidget, FooterWidget, HelpWidget, OpcodePanel, TelemetryPanelWidget
 from .trend_tracker import TrendTracker
-from ..telemetry.plugin_registry import create_live_plugin
+from ..telemetry.plugin_registry import make_plugin
 
 
 @dataclass
@@ -117,7 +117,7 @@ class LiveStatsCollector(Collector):
         mode=None,
         opcodes=False,
         async_aware=None,
-        telemetry_plugin_ids=None,
+        telemetry_plugins=None,
     ):
         """
         Initialize the live stats collector.
@@ -176,14 +176,15 @@ class LiveStatsCollector(Collector):
         # Opcode statistics: {location: {opcode: count}}
         self.opcode_stats = collections.defaultdict(lambda: collections.defaultdict(int))
         self.show_opcodes = opcodes  # Show opcode panel when --opcodes flag is passed
-        self.accepts_sample_timestamp = True  # sampler passes unwind-start time to collect()
-        self.show_telemetry_panel = bool(telemetry_plugin_ids)
-        self.telemetry_plugins = {}  # plugin_id -> plugin runtime
+        # Telemetry plugins (TelemetryPlugin instances) and their live panels.
+        self.show_telemetry_panel = bool(telemetry_plugins)
+        self.telemetry_panels = {}  # plugin_id -> TelemetryPanel
         self.telemetry_plugin_order = []
         self.current_telemetry_plugin_idx = 0
         self.current_telemetry_mode_idx = 0
-        for plugin_id in telemetry_plugin_ids or []:
-            self.set_plugin_enabled(plugin_id)
+        self.telemetry_plugins_for_sampler = list(telemetry_plugins or [])
+        for plugin in self.telemetry_plugins_for_sampler:
+            self._add_panel(plugin.plugin_id, plugin.create_panel())
         self.selected_row = 0  # Currently selected row in table for opcode view
         self.scroll_offset = 0  # Scroll offset for table when in opcode mode
 
@@ -407,13 +408,11 @@ class LiveStatsCollector(Collector):
                 thread_data = self._get_or_create_thread_data(thread_id)
                 thread_data.sample_count += 1
 
-        if self.telemetry_plugins:
+        if self.telemetry_panels:
             # timestamp_us is the sampler's perf_counter time at unwind start.
             now_ns = timestamp_us * 1000 if timestamp_us is not None else time.perf_counter_ns()
-            for plugin in self.telemetry_plugins.values():
-                observe = getattr(plugin, "observe_sample", None)
-                if observe is not None:
-                    observe(stack_frames, now_ns)
+            for panel in self.telemetry_panels.values():
+                panel.observe_sample(stack_frames, now_ns)
 
         if has_gc_frame:
             self.gc_frame_samples += 1
@@ -1141,35 +1140,45 @@ class LiveStatsCollector(Collector):
             "Use the live TUI to view statistics in real-time."
         )
 
-    def set_plugin_enabled(self, plugin_id):
-        if not plugin_id or plugin_id in self.telemetry_plugins:
+    # ---- telemetry plugin event API -----------------------------------------
+
+    accepts_plugin_events = True
+    accepts_sample_timestamp = True  # the sampler passes unwind-start time to collect()
+
+    def _add_panel(self, plugin_id, panel):
+        if not plugin_id or panel is None or plugin_id in self.telemetry_panels:
             return
-        plugin = create_live_plugin(plugin_id)
-        if plugin is None:
-            return
-        self.telemetry_plugins[plugin_id] = plugin
+        self.telemetry_panels[plugin_id] = panel
         self.telemetry_plugin_order.append(plugin_id)
 
-    def collect_plugin_event(self, plugin_id, event_type, payload):
-        plugin = self.telemetry_plugins.get(plugin_id)
-        if plugin is None:
-            self.set_plugin_enabled(plugin_id)
-            plugin = self.telemetry_plugins.get(plugin_id)
+    def set_plugin_enabled(self, plugin_id):
+        """Events will arrive for ``plugin_id``; create its panel if we have none."""
+        if plugin_id in self.telemetry_panels:
+            return
+        plugin = make_plugin(plugin_id)
         if plugin is not None:
-            plugin.ingest(event_type, payload)
+            self._add_panel(plugin_id, plugin.create_panel())
+
+    def collect_plugin_event(self, plugin_id, event_type, payload):
+        panel = self.telemetry_panels.get(plugin_id)
+        if panel is None:
+            self.set_plugin_enabled(plugin_id)
+            panel = self.telemetry_panels.get(plugin_id)
+        if panel is not None:
+            panel.ingest(event_type, payload)
 
     def _get_current_telemetry_plugin(self):
         if not self.telemetry_plugin_order:
             return None, None
         idx = self.current_telemetry_plugin_idx % len(self.telemetry_plugin_order)
         plugin_id = self.telemetry_plugin_order[idx]
-        return plugin_id, self.telemetry_plugins.get(plugin_id)
+        return plugin_id, self.telemetry_panels.get(plugin_id)
 
     def _cycle_telemetry_mode(self):
-        _, plugin = self._get_current_telemetry_plugin()
-        if plugin is None:
+        _, panel = self._get_current_telemetry_plugin()
+        if panel is None:
             return
-        modes = list(getattr(plugin, "panel_modes", ("default",)))
+        modes = list(panel.panel_modes)
         if not modes:
             return
         self.current_telemetry_mode_idx = (self.current_telemetry_mode_idx + 1) % len(modes)

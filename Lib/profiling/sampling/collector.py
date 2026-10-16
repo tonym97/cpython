@@ -144,6 +144,13 @@ def iter_async_frames(awaited_info_list):
 
 class Collector(ABC):
     aggregating = False
+    # Telemetry plugin events: collectors that store or render them set this
+    # and implement the three methods below; others leave the no-ops, and the
+    # sampler buffers the events for a text summary instead.
+    accepts_plugin_events = False
+    # True when collect() takes timestamp_us, the sampler's perf_counter time
+    # at unwind start (live collectors use it for telemetry attribution).
+    accepts_sample_timestamp = False
 
     @abstractmethod
     def collect(self, stack_frames, timestamps_us=None):
@@ -160,6 +167,15 @@ class Collector(ABC):
 
     def collect_failed_sample(self):
         """Collect data about a failed sample attempt."""
+
+    def set_plugin_enabled(self, plugin_id):
+        """A telemetry plugin will deliver events (no-op by default)."""
+
+    def set_plugin_metadata(self, plugin_id, metadata):
+        """Plugin metadata record (no-op by default)."""
+
+    def collect_plugin_event(self, plugin_id, event_type, payload):
+        """One telemetry plugin event (no-op by default)."""
 
     @abstractmethod
     def export(self, filename):

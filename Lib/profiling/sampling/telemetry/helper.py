@@ -1,31 +1,21 @@
-"""Generic in-Python helper-process entrypoint.
+"""Python helper process for plugins without a native helper.
 
-Used when a plugin has no native ``helper_command``. Runs the plugin's
-``run_helper`` and exits when it returns; the manager reports the exit to the
-collector as a ``health`` event.
+Started as ``python -m profiling.sampling.telemetry --plugin <id>
+--config-json <json>``. It instantiates the plugin with that config, runs
+its ``run_helper`` and exits when it returns; the manager reports the exit
+to the collector as a ``health`` event.
 """
-
-from __future__ import annotations
 
 import argparse
 import json
 import sys
 
-from .plugin_registry import run_helper_plugin
+from .plugin_registry import make_plugin
 
 
 def _emit(plugin_id, event_type, payload):
-    print(
-        json.dumps(
-            {
-                "plugin": plugin_id,
-                "event_type": event_type,
-                "payload": payload,
-            },
-            separators=(",", ":"),
-        ),
-        flush=True,
-    )
+    record = {"plugin": plugin_id, "event_type": event_type, "payload": payload}
+    print(json.dumps(record, separators=(",", ":")), flush=True)
 
 
 def main():
@@ -39,12 +29,17 @@ def main():
     except json.JSONDecodeError:
         config = {}
 
+    plugin = make_plugin(args.plugin, config)
+    if plugin is None:
+        _emit(args.plugin, "health", {"helper": "error", "notes": ["unknown plugin"]})
+        sys.exit(2)
     try:
-        run_helper_plugin(args.plugin, config, _emit)
+        plugin.run_helper(_emit)
     except KeyboardInterrupt:
         pass
-    except Exception as exc:  # report, do not spin
-        _emit(args.plugin, "health", {"helper": "error", "notes": [f"{type(exc).__name__}: {exc}"]})
+    except Exception as exc:
+        _emit(args.plugin, "health",
+              {"helper": "error", "notes": [f"{type(exc).__name__}: {exc}"]})
         sys.exit(1)
     _emit(args.plugin, "health", {"helper": "finished"})
 

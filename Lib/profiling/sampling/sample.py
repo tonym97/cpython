@@ -11,10 +11,12 @@ lazy from _colorize import get_colors
 from .binary_collector import BinaryCollector
 try:
     from .telemetry.manager import TelemetryHelperManager
-    from .telemetry.summary import TelemetryRecordBuffer
+    from .telemetry.plugin_registry import helper_command as _telemetry_helper_command
+    from .telemetry.records import TelemetryRecordBuffer
 except ImportError:
     TelemetryHelperManager = None
     TelemetryRecordBuffer = None
+    _telemetry_helper_command = None
 
 
 @contextlib.contextmanager
@@ -97,19 +99,18 @@ class SampleProfiler:
         self.sample_intervals = deque(maxlen=100)
         self.total_samples = 0
         self.realtime_stats = False
+        # Telemetry plugins (TelemetryPlugin instances): one helper process
+        # each. Their config gains target_pid now that the target is known.
         self.telemetry_managers = []
-        # Receives plugin events when the collector has no plugin event API
+        # Receives plugin events when the collector does not accept them
         # (every non-live, non-binary format); summarised as text afterwards.
         self.telemetry_buffer = None
         if telemetry_plugins and TelemetryHelperManager is not None:
             for plugin in telemetry_plugins:
-                plugin_id = plugin.get("id")
-                plugin_config = dict(plugin.get("config") or {})
-                plugin_config.setdefault("target_pid", self.pid)
-                if plugin_id:
-                    self.telemetry_managers.append(
-                        TelemetryHelperManager(plugin_id, plugin_config)
-                    )
+                plugin.config.setdefault("target_pid", self.pid)
+                self.telemetry_managers.append(
+                    TelemetryHelperManager(plugin.plugin_id, _telemetry_helper_command(plugin))
+                )
 
     def _new_unwinder(self, native, gc, opcodes, skip_non_matching_threads):
         kwargs = {}
@@ -166,14 +167,13 @@ class SampleProfiler:
             pending_timestamps = []
             collector.collect(prev_stack, timestamps_us=ts)
 
-        if self.telemetry_managers and not hasattr(collector, "collect_plugin_event") and TelemetryRecordBuffer is not None:
+        if self.telemetry_managers and not getattr(collector, "accepts_plugin_events", False):
             self.telemetry_buffer = TelemetryRecordBuffer()
             collector.telemetry_records = self.telemetry_buffer
         telemetry_sink = self.telemetry_buffer if self.telemetry_buffer is not None else collector
         for mgr in self.telemetry_managers:
             mgr.start()
-            if hasattr(telemetry_sink, "set_plugin_enabled"):
-                telemetry_sink.set_plugin_enabled(mgr.plugin_id)
+            telemetry_sink.set_plugin_enabled(mgr.plugin_id)
 
         try:
             while duration_sec is None or running_time_sec < duration_sec:
@@ -252,10 +252,12 @@ class SampleProfiler:
         finally:
             flush_pending()
             if self.telemetry_managers:
-                # Final drain before shutdown.
-                self._poll_telemetry_records(collector)
+                # Stop helpers first: stop() waits for the helper's final
+                # reports and for the reader thread, so the drain that follows
+                # sees everything the helper emitted on shutdown.
                 for mgr in self.telemetry_managers:
                     mgr.stop()
+                self._poll_telemetry_records(collector)
 
         # Clear real-time stats line if it was being displayed
         if self.realtime_stats and len(self.sample_intervals) > 0:
@@ -293,16 +295,13 @@ class SampleProfiler:
             )
 
     def _poll_telemetry_records(self, collector):
-        if self.telemetry_buffer is not None:
-            collector = self.telemetry_buffer
+        sink = self.telemetry_buffer if self.telemetry_buffer is not None else collector
         for mgr in self.telemetry_managers:
-            records = mgr.poll()
-            for event in records:
-                plugin_id = event.get("plugin", mgr.plugin_id)
+            for event in mgr.poll():
                 event_type = event.get("event_type")
-                payload = event.get("payload", {})
-                if hasattr(collector, "collect_plugin_event"):
-                    collector.collect_plugin_event(plugin_id, event_type, payload)
+                if event_type:
+                    sink.collect_plugin_event(
+                        event.get("plugin", mgr.plugin_id), event_type, event.get("payload", {}))
 
     def _print_realtime_stats(self):
         """Print real-time sampling statistics."""
