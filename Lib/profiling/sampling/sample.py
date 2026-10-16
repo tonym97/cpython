@@ -11,8 +11,10 @@ lazy from _colorize import get_colors
 from .binary_collector import BinaryCollector
 try:
     from .telemetry.manager import TelemetryHelperManager
+    from .telemetry.summary import TelemetryRecordBuffer
 except ImportError:
     TelemetryHelperManager = None
+    TelemetryRecordBuffer = None
 
 
 @contextlib.contextmanager
@@ -96,6 +98,9 @@ class SampleProfiler:
         self.total_samples = 0
         self.realtime_stats = False
         self.telemetry_managers = []
+        # Receives plugin events when the collector has no plugin event API
+        # (every non-live, non-binary format); summarised as text afterwards.
+        self.telemetry_buffer = None
         if telemetry_plugins and TelemetryHelperManager is not None:
             for plugin in telemetry_plugins:
                 plugin_id = plugin.get("id")
@@ -161,10 +166,14 @@ class SampleProfiler:
             pending_timestamps = []
             collector.collect(prev_stack, timestamps_us=ts)
 
+        if self.telemetry_managers and not hasattr(collector, "collect_plugin_event") and TelemetryRecordBuffer is not None:
+            self.telemetry_buffer = TelemetryRecordBuffer()
+            collector.telemetry_records = self.telemetry_buffer
+        telemetry_sink = self.telemetry_buffer if self.telemetry_buffer is not None else collector
         for mgr in self.telemetry_managers:
             mgr.start()
-            if hasattr(collector, "set_plugin_enabled"):
-                collector.set_plugin_enabled(mgr.plugin_id)
+            if hasattr(telemetry_sink, "set_plugin_enabled"):
+                telemetry_sink.set_plugin_enabled(mgr.plugin_id)
 
         try:
             while duration_sec is None or running_time_sec < duration_sec:
@@ -284,6 +293,8 @@ class SampleProfiler:
             )
 
     def _poll_telemetry_records(self, collector):
+        if self.telemetry_buffer is not None:
+            collector = self.telemetry_buffer
         for mgr in self.telemetry_managers:
             records = mgr.poll()
             for event in records:

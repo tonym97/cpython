@@ -23,7 +23,15 @@ from .gecko_collector import GeckoCollector
 from .jsonl_collector import JsonlCollector
 from .binary_collector import BinaryCollector
 from .binary_reader import BinaryReader
-from .telemetry.plugin_registry import resolve_helper_config, resolve_target_environment, is_known_plugin
+from .telemetry.plugin_registry import (
+    resolve_helper_config,
+    resolve_target_environment,
+    is_known_plugin,
+    register_cli_flags,
+    extract_cli_config,
+)
+from .telemetry.summary import TelemetryRecordBuffer, print_summary
+from .telemetry.chunks import TelemetryChunkReader
 from .constants import (
     MICROSECONDS_PER_SECOND,
     PROFILING_MODE_ALL,
@@ -446,8 +454,30 @@ def _add_sampling_options(parser):
         dest="plugins",
         action="append",
         default=[],
-        help="Enable a telemetry plugin (repeatable)",
+        help="Enable a telemetry plugin: a bundled id or an importable dotted module path (repeatable)",
     )
+    _add_plugin_cli_flags(parser)
+
+
+def _plugins_named_on_command_line(argv=None):
+    """Plugin ids given with --plugin, read before parsing so their options can be registered."""
+    argv = sys.argv[1:] if argv is None else argv
+    found = []
+    for i, token in enumerate(argv):
+        if token == "--plugin" and i + 1 < len(argv):
+            found.append(argv[i + 1])
+        elif token.startswith("--plugin="):
+            found.append(token.partition("=")[2])
+    return list(dict.fromkeys(found))
+
+
+def _add_plugin_cli_flags(parser):
+    """Let each plugin named on the command line add its own options."""
+    for plugin_id in _plugins_named_on_command_line():
+        if not is_known_plugin(plugin_id):
+            continue  # reported by _validate_args
+        group = parser.add_argument_group(f"Telemetry plugin options ({plugin_id})")
+        register_cli_flags(plugin_id, group)
 def _add_mode_options(parser):
     """Add mode options to a parser."""
     mode_group = parser.add_argument_group("Mode options")
@@ -811,6 +841,7 @@ def _replay_with_reader(args, reader):
             )
 
     count = reader.replay_samples(collector, progress_callback)
+    replayed_collector = collector
     if hasattr(collector, "set_replay_stats"):
         collector.set_replay_stats(info)
     if hasattr(collector, "set_mode"):
@@ -847,6 +878,7 @@ def _replay_with_reader(args, reader):
             _open_in_browser(filename)
 
     print(f"Replayed {count} samples")
+    _print_sidecar_summary(args.input_file, replayed_collector)
 
 
 def _handle_output(collector, args, pid, mode):
@@ -997,10 +1029,6 @@ def _validate_args(args, parser):
                 "Live mode uses a TUI interface with its own controls."
             )
         return
-
-    # Non-live GPU integration currently supports binary capture only.
-    if getattr(args, "plugins", None) and not args.live and getattr(args, "format", "pstats") != "binary":
-        parser.error("Telemetry plugins currently require --binary for non-live mode.")
 
     # Validate gecko mode doesn't use non-wall mode
     if args.format == "gecko" and getattr(args, 'mode', 'wall') != "wall":
@@ -1251,6 +1279,7 @@ def _handle_attach(args):
             telemetry_plugins=telemetry_plugins,
         )
         _handle_output(collector, args, args.pid, mode)
+        _print_telemetry_summary(collector)
 
 
 def _handle_dump(args):
@@ -1362,6 +1391,7 @@ def _handle_run(args):
                 telemetry_plugins=telemetry_plugins,
             )
             _handle_output(collector, args, process.pid, mode)
+            _print_telemetry_summary(collector)
         finally:
             # Terminate the main subprocess - child profilers finish when their
             # target processes exit
@@ -1499,20 +1529,45 @@ def _handle_replay(args):
         sys.exit(f"Error: {exc}")
 
 
+def _telemetry_plugin_config(plugin_id, args):
+    """Resolved helper config with the plugin's own command line options merged over it."""
+    config = resolve_helper_config(plugin_id)
+    config.update(extract_cli_config(plugin_id, args))
+    return config
+
+
 def _build_telemetry_plugins(args):
     plugins = []
     for plugin_id in getattr(args, "plugins", []) or []:
-        config = resolve_helper_config(plugin_id)
-        plugins.append({"id": plugin_id, "config": config})
+        plugins.append({"id": plugin_id, "config": _telemetry_plugin_config(plugin_id, args)})
     return plugins or None
+
+
+def _print_telemetry_summary(collector):
+    """Print buffered plugin events for collectors without a live panel or sidecar."""
+    print_summary(getattr(collector, "telemetry_records", None))
+
+
+def _print_sidecar_summary(binary_filename, collector):
+    """After replaying into a collector without a plugin event API, summarise the sidecar."""
+    if hasattr(collector, "collect_plugin_event"):
+        return
+    reader = TelemetryChunkReader(binary_filename)
+    if not reader.exists():
+        return
+    buffer = TelemetryRecordBuffer()
+    for record in reader.iter_records():
+        plugin_id, event_type = record.get("plugin"), record.get("event_type")
+        if plugin_id and event_type:
+            buffer.collect_plugin_event(plugin_id, event_type, record.get("payload", {}))
+    print_summary(buffer)
 
 
 def _telemetry_target_environment(args):
     """Environment variables telemetry plugins want on a target started by ``run``."""
     env = {}
     for plugin_id in getattr(args, "plugins", []) or []:
-        config = resolve_helper_config(plugin_id)
-        env.update(resolve_target_environment(plugin_id, config))
+        env.update(resolve_target_environment(plugin_id, _telemetry_plugin_config(plugin_id, args)))
     return env
 
 

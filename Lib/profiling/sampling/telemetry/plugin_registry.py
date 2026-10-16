@@ -26,6 +26,17 @@ Optional module hooks, all looked up by name:
     In-Python helper body; return when done.
 ``target_environment(config: dict) -> dict[str, str]``
     Environment variables to set on a target launched by ``run``.
+``register_cli_flags(parser)``
+    Add plugin-specific command line options to the ``run`` and ``attach``
+    parsers; called only for plugins named with ``--plugin`` on the command
+    line, so a plugin's options exist exactly when the plugin is enabled.
+``extract_cli_config(args) -> dict``
+    Turn parsed plugin options into helper config overrides, merged over
+    ``resolve_helper_config``.
+``summarize_records(records) -> list[str] | None``
+    Text summary of this plugin's events for outputs with no live panel
+    (non-binary capture formats and ``replay``). ``records`` are
+    ``(plugin_id, event_type, payload)`` tuples.
 """
 
 from __future__ import annotations
@@ -134,6 +145,31 @@ def resolve_target_environment(plugin_id, config):
     if callable(hook):
         return dict(hook(config) or {})
     return {}
+
+
+def register_cli_flags(plugin_id, parser):
+    module = _get_plugin_module(plugin_id)
+    hook = getattr(module, "register_cli_flags", None) if module else None
+    if callable(hook):
+        hook(parser)
+        return True
+    return False
+
+
+def extract_cli_config(plugin_id, args):
+    module = _get_plugin_module(plugin_id)
+    hook = getattr(module, "extract_cli_config", None) if module else None
+    if callable(hook):
+        return dict(hook(args) or {})
+    return {}
+
+
+def summarize_records(plugin_id, records):
+    module = _get_plugin_module(plugin_id)
+    hook = getattr(module, "summarize_records", None) if module else None
+    if callable(hook):
+        return hook(records)
+    return None
 
 
 def run_helper_plugin(plugin_id, config, emit):

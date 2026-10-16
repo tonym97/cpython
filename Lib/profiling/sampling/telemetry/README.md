@@ -29,6 +29,10 @@ and a live adapter that renders them.
 7. In binary mode `BinaryCollector` appends events to
    `<binary>.telemetrychunks`; `replay_sidecar_to_sink` reads them back for
    sinks that implement the plugin event API.
+   In every other non-live format the events go to a `TelemetryRecordBuffer`
+   and are printed as text after the CPU output, each plugin summarising its
+   own records through `summarize_records`; `replay` into a non-live format
+   does the same with the sidecar.
 8. For `run`, the CLI merges each plugin's `target_environment` into the
    target's environment before launching it.
 
@@ -45,6 +49,8 @@ and a live adapter that renders them.
   JSON lines).
 - `replay.py`: replays sidecar records into a sink.
 - `interfaces.py`: `LiveTelemetryPlugin`.
+- `summary.py`: `TelemetryRecordBuffer` and the text summary for outputs
+  without a live panel or sidecar.
 - `plugins/`: bundled plugins, discovered by `PLUGIN_ID`.
 
 ---
@@ -60,6 +66,9 @@ A plugin module defines `PLUGIN_ID` and any of these hooks:
 | `helper_command(config) -> list[str] \| None` | argv of a native helper speaking the event protocol |
 | `run_helper(config, emit)` | in-Python helper body; return when finished |
 | `target_environment(config) -> dict` | environment for targets started by `run` |
+| `register_cli_flags(parser)` | plugin options on `run` and `attach`, registered when the plugin is named with `--plugin` |
+| `extract_cli_config(args) -> dict` | parsed plugin options merged over the helper config |
+| `summarize_records(records) -> list[str] \| None` | text summary for non-live formats and `replay` |
 
 `LiveTelemetryPlugin`:
 
@@ -96,7 +105,10 @@ by the framework: `helper` (`failed`, `exited`, `overflow`, `finished`,
 ## CLI validation
 
 - Unknown plugin ids are rejected at argument parsing.
-- Without `--live`, plugins require `--binary` output.
+- Plugins named with `--plugin` contribute their own options to `run` and
+  `attach`; `--help` with `--plugin <id>` shows them.
+- Plugins work with every output format: live panel, binary sidecar, or a
+  text summary after the CPU output.
 
 ---
 
@@ -117,7 +129,7 @@ by the framework: `helper` (`failed`, `exited`, `overflow`, `finished`,
 | Dotted-module plugin resolution | built | profiler |
 | Target environment injection for `run` | built | profiler |
 | Per-sample `observe_sample` hook | built | profiler |
-| Plugin-specific CLI flags (`register_cli_flags`, `extract_cli_config`) | not built; configure through `resolve_helper_config` | profiler |
-| Sidecar format | JSON lines; a binary chunk format is optional | profiler |
-| Replay of plugin events into non-live collectors | not built | profiler |
-| Non-live capture in formats other than binary | not built | profiler |
+| Plugin-specific CLI flags (`register_cli_flags`, `extract_cli_config`) | built | profiler |
+| Sidecar format | built: JSON lines with a magic header, readable without the profiler | profiler |
+| Replay of plugin events into non-live collectors | built: text summary via `summarize_records` | profiler |
+| Non-live capture in formats other than binary | built: events buffered and summarised after the CPU output | profiler |
