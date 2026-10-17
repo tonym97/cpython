@@ -1,7 +1,11 @@
 """Telemetry event records and the in-memory record buffer."""
 
-import collections
 from dataclasses import dataclass, field
+
+# Version of the helper wire protocol: one JSON object per line,
+# ``{"v": 1, "plugin": id, "event_type": str, "payload": {...}}``. Records
+# without ``v`` are version 1.
+PROTOCOL_VERSION = 1
 
 
 @dataclass(frozen=True)
@@ -37,15 +41,9 @@ class TelemetryRecordBuffer:
         self.dropped = 0
         self._max_records = max_records
 
-    def set_plugin_enabled(self, plugin_id):
-        if plugin_id and plugin_id not in self.plugin_ids:
-            self.plugin_ids.append(plugin_id)
-
-    def set_plugin_metadata(self, plugin_id, metadata):
-        self.collect_plugin_event(plugin_id, "metadata", metadata)
-
     def collect_plugin_event(self, plugin_id, event_type, payload):
-        self.set_plugin_enabled(plugin_id)
+        if plugin_id not in self.plugin_ids:
+            self.plugin_ids.append(plugin_id)
         if len(self.records) >= self._max_records:
             self.dropped += 1
             return
@@ -53,9 +51,7 @@ class TelemetryRecordBuffer:
 
     def by_plugin(self):
         """Records grouped by plugin id, in first-seen order."""
-        groups = collections.OrderedDict()
-        for plugin_id in self.plugin_ids:
-            groups[plugin_id] = []
+        groups = {plugin_id: [] for plugin_id in self.plugin_ids}
         for record in self.records:
             groups.setdefault(record.plugin_id, []).append(record)
         return groups

@@ -12,6 +12,7 @@ plugins that return ``None`` get a generic event count.
 import collections
 
 from .plugin_registry import make_plugin
+from .records import TelemetryRecordBuffer
 
 
 def _generic_summary(records):
@@ -22,7 +23,7 @@ def _generic_summary(records):
 
 def summary_lines(buffer):
     """Summary of a ``TelemetryRecordBuffer``, one section per plugin."""
-    if buffer is None or not len(buffer):
+    if not isinstance(buffer, TelemetryRecordBuffer) or not buffer:
         return []
     lines = []
     for plugin_id, records in buffer.by_plugin().items():

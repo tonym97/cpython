@@ -19,6 +19,17 @@ and the collector measures one of its own for live captures.
 
 from dataclasses import dataclass, field
 
+# The Firefox Profiler accepts only these graph colours and marker field
+# formats; the collector replaces anything else so the profile still loads.
+GECKO_GRAPH_COLORS = frozenset({
+    "blue", "green", "grey", "ink", "magenta", "orange", "purple", "red", "teal", "yellow",
+})
+GECKO_FIELD_FORMATS = frozenset({
+    "url", "file-path", "sanitized-string", "string", "unique-string", "duration", "time",
+    "seconds", "milliseconds", "microseconds", "nanoseconds", "bytes", "percentage",
+    "integer", "decimal", "flow-id", "terminating-flow-id", "list", "pid", "tid",
+})
+
 
 class TelemetryClock:
     """Maps wall-clock nanoseconds (CLOCK_REALTIME) to profile milliseconds.
@@ -90,7 +101,6 @@ class GeckoSeries:
     label: str = ""
     color: str = "grey"
     format: str = "decimal"
-    metric_id: str = None
 
 
 @dataclass

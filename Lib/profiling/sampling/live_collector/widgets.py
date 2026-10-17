@@ -973,6 +973,14 @@ class HelpWidget(Widget):
             ("  c           - Clear filter", A_NORMAL),
             ("  ESC         - Cancel filter input", A_NORMAL),
             ("", A_NORMAL),
+        ]
+        telemetry_keys = kwargs.get("telemetry_keys") or []
+        if telemetry_keys:
+            help_lines.append(("Telemetry plugin keys:", A_BOLD))
+            for key, description in telemetry_keys:
+                help_lines.append((f"  {key:<11} - {description}", A_NORMAL))
+            help_lines.append(("", A_NORMAL))
+        help_lines += [
             ("Other:", A_BOLD),
             ("  h or ?      - Show/hide this help", A_NORMAL),
             ("  q           - Quit profiler", A_NORMAL),
@@ -1099,9 +1107,9 @@ class TelemetryPanelWidget(Widget):
     ``samples``                   the CPU table's sample-count colour
     ``trend_up``, ``trend_down``  the CPU table's trend colours
 
-    Before rendering, the widget passes the TUI's trend toggle (``x``) to the
-    panel through ``set_trends_enabled`` so it can colour changing values the
-    same way the CPU table does.
+    The panel follows the TUI's trend toggle (``x``) itself, through
+    ``handle_key``, so it colours changing values the same way the CPU table
+    does.
     """
 
     def __init__(self, display, colors, collector):
@@ -1169,8 +1177,6 @@ class TelemetryPanelWidget(Widget):
         self.add_str(line, 0, title[: width - 1], self.colors.get("magenta", A_BOLD) | A_BOLD)
         line += 1
 
-        tracker = getattr(self.collector, "_trend_tracker", None)
-        panel.set_trends_enabled(tracker is not None and tracker.enabled)
         for panel_line in panel.render_lines(mode, width)[: TELEMETRY_PANEL_HEIGHT - 1]:
             try:
                 self._draw_line(line, width, panel_line)

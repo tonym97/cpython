@@ -454,7 +454,8 @@ def _add_sampling_options(parser):
         dest="plugins",
         action="append",
         default=[],
-        help="Enable a telemetry plugin: a bundled id or an importable dotted module path (repeatable)",
+        help="Enable a telemetry plugin: a bundled id or an importable dotted "
+             "module path (repeatable)",
     )
     _add_plugin_cli_flags(parser)
 
@@ -948,7 +949,9 @@ def _validate_args(args, parser):
         for plugin_id in args.plugins:
             if not is_known_plugin(plugin_id):
                 bundled = ", ".join(list_plugin_ids()) or "none"
-                parser.error(f"Unknown telemetry plugin {plugin_id!r} (bundled plugins: {bundled}; or give an importable dotted module path)")
+                parser.error(
+                    f"Unknown telemetry plugin {plugin_id!r} (bundled plugins: {bundled}; "
+                    "or give an importable dotted module path)")
 
     # Check if live mode is available
     if hasattr(args, 'live') and args.live and LiveStatsCollector is None:
@@ -1412,6 +1415,7 @@ def _handle_live_attach(args, pid):
     skip_idle = mode != PROFILING_MODE_WALL
 
     # Create live collector with default settings
+    telemetry_plugins = _build_telemetry_plugins(args)
     collector = LiveStatsCollector(
         args.sample_interval_usec,
         skip_idle=skip_idle,
@@ -1421,9 +1425,8 @@ def _handle_live_attach(args, pid):
         mode=mode,
         opcodes=args.opcodes,
         async_aware=args.async_mode if args.async_aware else None,
-        telemetry_plugins=_build_telemetry_plugins(args),
+        telemetry_plugins=telemetry_plugins,
     )
-    telemetry_plugins = collector.telemetry_plugins_for_sampler
 
     # Sample in live mode
     sample_live(
@@ -1462,6 +1465,7 @@ def _handle_live_run(args):
     skip_idle = mode != PROFILING_MODE_WALL
 
     # Create live collector with default settings
+    telemetry_plugins = _build_telemetry_plugins(args)
     collector = LiveStatsCollector(
         args.sample_interval_usec,
         skip_idle=skip_idle,
@@ -1471,9 +1475,8 @@ def _handle_live_run(args):
         mode=mode,
         opcodes=args.opcodes,
         async_aware=args.async_mode if args.async_aware else None,
-        telemetry_plugins=_build_telemetry_plugins(args),
+        telemetry_plugins=telemetry_plugins,
     )
-    telemetry_plugins = collector.telemetry_plugins_for_sampler
 
     # Profile the subprocess in live mode
     try:
@@ -1536,11 +1539,10 @@ def _build_telemetry_plugins(args):
     (helper processes), so both see one configuration.
     """
     plugins = []
-    for plugin_id in getattr(args, "plugins", []) or []:
+    for plugin_id in getattr(args, "plugins", None) or ():
         plugin_class = get_plugin_class(plugin_id)
-        if plugin_class is None:
-            continue
-        plugins.append(plugin_class(plugin_class.resolve_config(plugin_class.extract_cli_config(args))))
+        if plugin_class is not None:
+            plugins.append(make_plugin(plugin_id, plugin_class.extract_cli_config(args)))
     return plugins or None
 
 
@@ -1553,7 +1555,7 @@ def _print_telemetry_lines(buffer):
 
 def _print_telemetry_summary(collector):
     """Print buffered plugin events for collectors without a live panel or sidecar."""
-    _print_telemetry_lines(getattr(collector, "telemetry_records", None))
+    _print_telemetry_lines(collector.telemetry_records)
 
 
 def _print_sidecar_summary(binary_filename, collector):

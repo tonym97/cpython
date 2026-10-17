@@ -11,10 +11,12 @@ import json
 import sys
 
 from .plugin_registry import make_plugin
+from .records import PROTOCOL_VERSION
 
 
 def _emit(plugin_id, event_type, payload):
-    record = {"plugin": plugin_id, "event_type": event_type, "payload": payload}
+    record = {"v": PROTOCOL_VERSION, "plugin": plugin_id, "event_type": event_type,
+              "payload": payload}
     print(json.dumps(record, separators=(",", ":")), flush=True)
 
 

@@ -9,14 +9,8 @@ from collections import deque
 lazy from _colorize import get_colors
 
 from .binary_collector import BinaryCollector
-try:
-    from .telemetry.manager import TelemetryHelperManager
-    from .telemetry.plugin_registry import helper_command as _telemetry_helper_command
-    from .telemetry.records import TelemetryRecordBuffer
-except ImportError:
-    TelemetryHelperManager = None
-    TelemetryRecordBuffer = None
-    _telemetry_helper_command = None
+from .telemetry.manager import TelemetryHelperManager
+from .telemetry.records import TelemetryRecordBuffer
 
 
 @contextlib.contextmanager
@@ -105,12 +99,11 @@ class SampleProfiler:
         # Receives plugin events when the collector does not accept them
         # (every non-live, non-binary format); summarised as text afterwards.
         self.telemetry_buffer = None
-        if telemetry_plugins and TelemetryHelperManager is not None:
-            for plugin in telemetry_plugins:
-                plugin.config.setdefault("target_pid", self.pid)
-                self.telemetry_managers.append(
-                    TelemetryHelperManager(plugin.plugin_id, _telemetry_helper_command(plugin))
-                )
+        for plugin in telemetry_plugins or ():
+            plugin.config.setdefault("target_pid", self.pid)
+            self.telemetry_managers.append(
+                TelemetryHelperManager(plugin.plugin_id, plugin.helper_argv())
+            )
 
     def _new_unwinder(self, native, gc, opcodes, skip_non_matching_threads):
         kwargs = {}
@@ -170,10 +163,8 @@ class SampleProfiler:
         if self.telemetry_managers and not getattr(collector, "accepts_plugin_events", False):
             self.telemetry_buffer = TelemetryRecordBuffer()
             collector.telemetry_records = self.telemetry_buffer
-        telemetry_sink = self.telemetry_buffer if self.telemetry_buffer is not None else collector
         for mgr in self.telemetry_managers:
             mgr.start()
-            telemetry_sink.set_plugin_enabled(mgr.plugin_id)
 
         try:
             while duration_sec is None or running_time_sec < duration_sec:

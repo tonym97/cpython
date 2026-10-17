@@ -1,8 +1,10 @@
 """Helper process management for telemetry plugins.
 
 One ``TelemetryHelperManager`` owns one helper subprocess. The helper prints
-JSON lines ``{"plugin": id, "event_type": str, "payload": {...}}`` on
-stdout. A reader thread parses them into a bounded queue so the profiler's
+JSON lines ``{"v": 1, "plugin": id, "event_type": str, "payload": {...}}`` on
+stdout (``v`` is the protocol version, ``PROTOCOL_VERSION``; a helper
+speaking a newer version gets one ``health`` warning and its events are
+still delivered). A reader thread parses them into a bounded queue so the profiler's
 sampling loop only ever does a cheap non-blocking drain. Helper death is
 reported as a synthetic ``health`` event carrying the exit status and the
 helper's last stderr lines.
@@ -12,6 +14,8 @@ import collections
 import json
 import subprocess
 import threading
+
+from .records import PROTOCOL_VERSION
 
 MAX_QUEUED_EVENTS = 50_000
 STDERR_TAIL_LINES = 20
@@ -32,6 +36,7 @@ class TelemetryHelperManager:
         self._stderr_tail = collections.deque(maxlen=STDERR_TAIL_LINES)
         self._started = False
         self._exit_reported = False
+        self._version_reported = False
 
     # ---- lifecycle ----------------------------------------------------------
 
@@ -112,9 +117,21 @@ class TelemetryHelperManager:
                 except json.JSONDecodeError:
                     continue
                 if isinstance(event, dict):
+                    self._check_version(event)
                     self._push(event)
         except (OSError, ValueError):
             pass
+
+    def _check_version(self, event):
+        version = event.get("v", 1)
+        if version == PROTOCOL_VERSION or self._version_reported:
+            return
+        self._version_reported = True
+        self._push(self._health({
+            "helper": "warning",
+            "notes": [f"helper speaks telemetry protocol v{version}; "
+                      f"this profiler reads v{PROTOCOL_VERSION}"],
+        }))
 
     def _read_stderr(self):
         try:

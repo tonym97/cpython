@@ -8,6 +8,8 @@ import argparse
 import io
 import json
 import os
+import pathlib
+import subprocess
 import sys
 import tempfile
 import textwrap
@@ -16,7 +18,6 @@ import types
 import unittest
 from unittest import mock
 
-from test.support import os_helper
 
 try:
     import _remote_debugging  # noqa: F401
@@ -31,9 +32,9 @@ from profiling.sampling.live_collector import LiveStatsCollector
 from profiling.sampling.pstats_collector import PstatsCollector
 from profiling.sampling.sample import SampleProfiler
 from profiling.sampling.telemetry import (
+    PROTOCOL_VERSION,
     GeckoContribution,
     GeckoSeries,
-    ModuleHookPlugin,
     Segment,
     TelemetryChunkReader,
     TelemetryChunkWriter,
@@ -43,9 +44,11 @@ from profiling.sampling.telemetry import (
     TelemetryPlugin,
     TelemetryRecord,
     TelemetryRecordBuffer,
+    frame_location,
     get_plugin_class,
-    helper_command,
     is_known_plugin,
+    iter_thread_frames,
+    list_plugin_ids,
     make_plugin,
     replay_sidecar_to_sink,
     summary_lines,
@@ -61,12 +64,20 @@ from .mocks import MockFrameInfo, MockInterpreterInfo, MockThreadInfo
 
 class FakePanel(TelemetryPanel):
     panel_modes = ("counts", "health")
+    key_bindings = (("z", "zero the counts"),)
 
     def __init__(self):
         super().__init__()
         self.events = []
         self.samples = []
+        self.keys = []
         self.version = 0
+
+    def handle_key(self, key):
+        super().handle_key(key)
+        self.keys.append(key)
+        if key == "z":
+            self.events.clear()
 
     def ingest(self, event_type, payload):
         self.events.append((event_type, payload))
@@ -200,71 +211,55 @@ class TestPluginRegistry(TelemetryTestCase):
         cls = get_plugin_class(FAKES_PACKAGE + ".test_anonymous_telemetry_plugin")
         self.assertEqual(cls.plugin_id, FAKES_PACKAGE + ".test_anonymous_telemetry_plugin")
 
-    def test_module_hook_plugin_adapter(self):
-        seen = {}
+    def test_dotted_module_also_registers_its_own_id(self):
+        self.assertIs(get_plugin_class(FAKE_ID), FakePlugin)
+        # Events carry plugin_id, not the dotted path; both must resolve here.
+        self.assertIs(get_plugin_class("fake_plugin"), FakePlugin)
 
-        def create_live_plugin(config=None):
-            seen["panel_config"] = config
-            return FakePanel()
+    def test_entry_point_plugin(self):
+        class EntryPointPlugin(TelemetryPlugin):
+            pass
 
-        module = _install_module(
-            FAKES_PACKAGE + ".test_hook_telemetry_plugin",
-            PLUGIN_ID="hooked",
-            resolve_helper_config=lambda config=None: {"interval_ms": 7, **(config or {})},
-            helper_command=lambda config: ["helper", "--pid", str(config["target_pid"])],
-            target_environment=lambda config: {"HOOKED": str(config["interval_ms"])},
-            register_cli_flags=lambda parser: parser.add_argument("--hooked-x", default=argparse.SUPPRESS),
-            extract_cli_config=lambda args: {"x": args.hooked_x} if hasattr(args, "hooked_x") else {},
-            create_live_plugin=create_live_plugin,
-            summarize_records=lambda records: [f"{len(records)} tuples {records[0][1]}"],
-            gecko_contribution=lambda records, clock: seen.setdefault("gecko", records),
-        )
-        cls = get_plugin_class(FAKES_PACKAGE + ".test_hook_telemetry_plugin")
-        self.assertTrue(issubclass(cls, ModuleHookPlugin))
-        self.assertEqual(cls.plugin_id, "hooked")
-        self.assertEqual(cls.default_config(), {"interval_ms": 7})
+        class FakeEntryPoint:
+            def __init__(self, name, target):
+                self.name, self._target = name, target
 
-        parser = argparse.ArgumentParser()
-        cls.register_cli_flags(parser)
-        args = parser.parse_args(["--hooked-x", "1"])
-        self.assertEqual(cls.extract_cli_config(args), {"x": "1"})
+            def load(self):
+                if isinstance(self._target, Exception):
+                    raise self._target
+                return self._target
 
-        plugin = cls(cls.resolve_config({"target_pid": 42}))
-        self.assertEqual(plugin.helper_command(), ["helper", "--pid", "42"])
-        self.assertEqual(plugin.target_environment(), {"HOOKED": "7"})
-        self.assertIsInstance(plugin.create_panel(), FakePanel)
-        self.assertEqual(seen["panel_config"], plugin.config)
+        module = types.ModuleType("test_entry_point_module")
+        module.PLUGIN = EntryPointPlugin
+        entry_points = [
+            FakeEntryPoint("ep_plugin", EntryPointPlugin),
+            FakeEntryPoint("ep_module", module),
+            FakeEntryPoint("ep_broken", ImportError("missing dependency")),
+            FakeEntryPoint("ep_not_a_plugin", object()),
+        ]
+        with mock.patch.object(plugin_registry, "_entry_points", return_value=entry_points):
+            self.assertIs(get_plugin_class("ep_plugin"), EntryPointPlugin)
+            self.assertEqual(EntryPointPlugin.plugin_id, "ep_plugin")
+            self.assertIs(get_plugin_class("ep_module"), EntryPointPlugin)
+            self.assertIsNone(get_plugin_class("ep_broken"))
+            self.assertIsNone(get_plugin_class("ep_not_a_plugin"))
+            self.assertIn("ep_plugin", list_plugin_ids())
+            plugin = make_plugin("ep_plugin", {"target_pid": 7})
+            self.assertEqual(plugin.config, {"target_pid": 7})
 
-        records = _records("hooked", ("a", {}), ("b", {}))
-        self.assertEqual(plugin.summarize(records), ["2 tuples a"])
-        plugin.gecko_contribution(records, None)
-        self.assertEqual(seen["gecko"], [("hooked", "a", {}), ("hooked", "b", {})])
-
-    def test_module_hook_plugin_without_hooks(self):
-        _install_module(FAKES_PACKAGE + ".test_bare_hook_plugin", PLUGIN_ID="bare")
-        plugin = make_plugin(FAKES_PACKAGE + ".test_bare_hook_plugin")
-        self.assertEqual(plugin.config, {})
-        self.assertIsNone(plugin.helper_command())
-        self.assertIsNone(plugin.create_panel())
-        self.assertIsNone(plugin.summarize([]))
-        self.assertEqual(plugin.target_environment(), {})
-        emitted = []
-        plugin.run_helper(lambda *event: emitted.append(event))
-        self.assertEqual(emitted[0][:2], ("bare", "health"))
-
-    def test_helper_command_defaults_to_python_helper(self):
+    def test_helper_argv_defaults_to_python_helper(self):
         plugin = make_plugin(FAKE_ID, {"target_pid": 3})
-        command = helper_command(plugin)
+        command = plugin.helper_argv()
         self.assertEqual(command[:3], [sys.executable, "-m", "profiling.sampling.telemetry"])
         self.assertIn("--plugin", command)
         self.assertEqual(json.loads(command[-1]), plugin.config)
 
-    def test_helper_command_uses_native_helper(self):
+    def test_helper_argv_uses_native_helper(self):
         class Native(FakePlugin):
             def helper_command(self):
                 return ("native-helper", "--pid", str(self.config["target_pid"]))
         plugin = Native({"target_pid": 5})
-        self.assertEqual(helper_command(plugin), ["native-helper", "--pid", "5"])
+        self.assertEqual(plugin.helper_argv(), ["native-helper", "--pid", "5"])
 
     def test_base_plugin_defaults(self):
         plugin = TelemetryPlugin()
@@ -273,7 +268,7 @@ class TestPluginRegistry(TelemetryTestCase):
         self.assertIsNone(plugin.create_panel())
         self.assertIsNone(plugin.summarize([]))
         self.assertIsNone(plugin.gecko_contribution([], None))
-        self.assertEqual(TelemetryPlugin.resolve_config({"a": 1}), {"a": 1})
+        self.assertEqual(TelemetryPlugin({"a": 1}).config, {"a": 1})
 
 
 # ---- helper manager ---------------------------------------------------------
@@ -282,7 +277,8 @@ class TestPluginRegistry(TelemetryTestCase):
 HELPER_SCRIPT = textwrap.dedent("""
     import json, sys, time
     for i in range(3):
-        print(json.dumps({"plugin": "p", "event_type": "tick", "payload": {"i": i}}), flush=True)
+        record = {"v": 1, "plugin": "p", "event_type": "tick", "payload": {"i": i}}
+        print(json.dumps(record), flush=True)
     print("not json", flush=True)
     print("", flush=True)
     sys.stderr.write("helper warning\\n")
@@ -330,6 +326,56 @@ class TestHelperManager(unittest.TestCase):
         manager.stop()
         self.assertEqual(manager.poll(), [])
 
+    def test_newer_protocol_version_warns_once(self):
+        script = textwrap.dedent("""
+            import json
+            for i in range(2):
+                record = {"v": 99, "plugin": "p", "event_type": "tick", "payload": {"i": i}}
+                print(json.dumps(record), flush=True)
+        """)
+        manager = TelemetryHelperManager("p", [sys.executable, "-c", script])
+        manager.start()
+        deadline = time.monotonic() + 30
+        while manager.alive and time.monotonic() < deadline:
+            time.sleep(0.01)
+        manager.stop()
+        events = manager.poll()
+        warnings = [e for e in events
+                    if e["event_type"] == "health" and e["payload"]["helper"] == "warning"]
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("protocol v99", warnings[0]["payload"]["notes"][0])
+        self.assertIn(f"reads v{PROTOCOL_VERSION}", warnings[0]["payload"]["notes"][0])
+        # The events themselves still arrive.
+        self.assertEqual([e["payload"]["i"] for e in events if e["event_type"] == "tick"], [0, 1])
+
+    def test_python_helper_emits_protocol_version(self):
+        # A real plugin module on disk, since the helper is a separate process.
+        with tempfile.TemporaryDirectory() as tmp:
+            package = pathlib.Path(tmp, "tmp_telemetry_pkg")
+            package.mkdir()
+            package.joinpath("__init__.py").write_text("")
+            package.joinpath("plugin.py").write_text(textwrap.dedent("""
+                from profiling.sampling.telemetry import TelemetryPlugin
+
+                class Plugin(TelemetryPlugin):
+                    plugin_id = "tmp_plugin"
+
+                    def run_helper(self, emit):
+                        emit(self.plugin_id, "tick", {"pid": self.config.get("target_pid")})
+
+                PLUGIN = Plugin
+            """))
+            command = [sys.executable, "-m", "profiling.sampling.telemetry",
+                       "--plugin", "tmp_telemetry_pkg.plugin", "--config-json", '{"target_pid": 7}']
+            env = dict(os.environ, PYTHONPATH=tmp + os.pathsep + os.environ.get("PYTHONPATH", ""))
+            proc = subprocess.run(command, capture_output=True, text=True, timeout=60, env=env)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        records = [json.loads(line) for line in proc.stdout.splitlines() if line.strip()]
+        self.assertEqual([r["event_type"] for r in records], ["tick", "health"])
+        self.assertTrue(all(r["v"] == PROTOCOL_VERSION for r in records))
+        self.assertEqual(records[0]["payload"], {"pid": 7})
+        self.assertEqual(records[1]["payload"]["helper"], "finished")
+
     def test_queue_overflow_is_reported(self):
         manager = TelemetryHelperManager("p", ["unused"])
         for i in range(manager._events.maxlen + 5):
@@ -347,17 +393,16 @@ class TestRecordsAndSummary(TelemetryTestCase):
         buffer = TelemetryRecordBuffer(max_records=2)
         self.assertTrue(buffer.accepts_plugin_events)
         self.assertFalse(buffer.accepts_sample_timestamp)
-        buffer.set_plugin_enabled("b")
+        buffer.collect_plugin_event("b", "x", {})
         buffer.collect_plugin_event("a", "x", {"n": 1})
-        buffer.set_plugin_metadata("a", {"provider": "test"})
+        buffer.collect_plugin_event("a", "metadata", {"provider": "test"})
         buffer.collect_plugin_event("a", "x", {"n": 2})
         self.assertEqual(len(buffer), 2)
-        self.assertEqual(buffer.dropped, 1)
+        self.assertEqual(buffer.dropped, 2)
         groups = buffer.by_plugin()
-        self.assertEqual(list(groups), ["b", "a"])
-        self.assertEqual(groups["b"], [])
-        self.assertEqual([r.event_type for r in groups["a"]], ["x", "metadata"])
-        self.assertEqual(list(buffer)[0], TelemetryRecord("a", "x", {"n": 1}))
+        self.assertEqual(list(groups), ["b", "a"])  # first-seen order
+        self.assertEqual([r.event_type for r in groups["a"]], ["x"])
+        self.assertEqual(list(buffer)[1], TelemetryRecord("a", "x", {"n": 1}))
 
     def test_summary_lines_use_plugin_and_generic_fallback(self):
         buffer = TelemetryRecordBuffer()
@@ -378,6 +423,7 @@ class TestRecordsAndSummary(TelemetryTestCase):
     def test_summary_lines_empty(self):
         self.assertEqual(summary_lines(None), [])
         self.assertEqual(summary_lines(TelemetryRecordBuffer()), [])
+        self.assertEqual(summary_lines(mock.MagicMock()), [])
 
     def test_sidecar_roundtrip_and_replay(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -387,9 +433,11 @@ class TestRecordsAndSummary(TelemetryTestCase):
             writer.write_record("p", "tick", {"i": 1})
             writer.write_record("", "ignored", {})
             writer.close()
+            raw = list(TelemetryChunkReader(binary).iter_records())
+            self.assertTrue(all(r["v"] == PROTOCOL_VERSION for r in raw))
             reader = TelemetryChunkReader(binary)
             self.assertTrue(reader.exists())
-            with open(reader.path if hasattr(reader, "path") else binary + ".telemetrychunks") as f:
+            with open(reader.sidecar_path) as f:
                 self.assertEqual(f.readline().strip(), "TCHUNK1")
 
             buffer = TelemetryRecordBuffer()
@@ -406,8 +454,7 @@ class TestRecordsAndSummary(TelemetryTestCase):
         with tempfile.TemporaryDirectory() as tmp:
             binary = os.path.join(tmp, "profile.bin")
             collector = BinaryCollector(binary, 1000)
-            collector.set_plugin_enabled("p")
-            collector.set_plugin_metadata("p", {"provider": "test"})
+            collector.collect_plugin_event("p", "metadata", {"provider": "test"})
             collector.collect_plugin_event("p", "tick", {"i": 1})
             collector.export(binary)
             records = list(TelemetryChunkReader(binary).iter_records())
@@ -417,9 +464,7 @@ class TestRecordsAndSummary(TelemetryTestCase):
         self.assertFalse(Collector.accepts_plugin_events)
         self.assertFalse(Collector.accepts_sample_timestamp)
         collector = PstatsCollector(1000)
-        collector.set_plugin_enabled("p")
-        collector.set_plugin_metadata("p", {})
-        collector.collect_plugin_event("p", "tick", {})  # no-ops
+        collector.collect_plugin_event("p", "tick", {})  # no-op
 
 
 # ---- sampler integration ----------------------------------------------------
@@ -467,7 +512,7 @@ class TestSamplerIntegration(TelemetryTestCase):
         self.assertEqual(len(profiler.telemetry_buffer), 2)
 
     def test_constructor_builds_managers_with_target_pid(self):
-        plugin = FakePlugin(FakePlugin.resolve_config())
+        plugin = make_plugin(FAKE_ID)
         with mock.patch("profiling.sampling.sample._resolve_python_pid", return_value=1234), \
              mock.patch("profiling.sampling.sample._remote_debugging.RemoteUnwinder"):
             profiler = SampleProfiler(1234, 1000, all_threads=False, telemetry_plugins=[plugin])
@@ -481,17 +526,39 @@ class TestSamplerIntegration(TelemetryTestCase):
 # ---- live panel and widget --------------------------------------------------
 
 
+class TestSampleAccessors(unittest.TestCase):
+    def test_iter_thread_frames_and_frame_location(self):
+        frames_a = [MockFrameInfo("a.py", 10, "leaf"), MockFrameInfo("a.py", 20, "caller")]
+        sample = [MockInterpreterInfo(0, [
+            MockThreadInfo(11, frames_a),
+            MockThreadInfo(12, []),            # no stack: skipped
+            MockThreadInfo(None, frames_a),    # no thread id: skipped
+        ])]
+        self.assertEqual([(tid, len(frames)) for tid, frames in iter_thread_frames(sample)],
+                         [(11, 2)])
+        self.assertEqual(frame_location(frames_a[0]), ("leaf", "a.py", 10))
+        self.assertEqual(list(iter_thread_frames(None)), [])
+        self.assertEqual(list(iter_thread_frames([types.SimpleNamespace()])), [])
+        plain = types.SimpleNamespace(funcname="f", filename="x.py", lineno=7)
+        self.assertEqual(frame_location(plain), ("f", "x.py", 7))
+        self.assertEqual(frame_location(types.SimpleNamespace(location=3)), ("", "", 3))
+
+
 class TestPanel(unittest.TestCase):
     def test_trend_style_respects_toggle_and_version(self):
         panel = FakePanel()
+        self.assertTrue(panel.trends_enabled)  # on by default, like the TUI's tracker
+        panel.handle_key("x")
+        self.assertFalse(panel.trends_enabled)
         self.assertEqual(panel.trend_style("k", "m", 1.0, "normal", version=1), "normal")
-        panel.set_trends_enabled(True)
+        panel.handle_key("X")
+        self.assertTrue(panel.trends_enabled)
         self.assertEqual(panel.trend_style("k", "m", 2.0, "normal", version=2), "trend_up")
         # Same data version: held, even though the value is unchanged now.
         self.assertEqual(panel.trend_style("k", "m", 2.0, "normal", version=2), "trend_up")
         self.assertEqual(panel.trend_style("k", "m", 2.0, "normal", version=3), "normal")
         self.assertEqual(panel.trend_style("k", "m", 1.5, "cyan", version=4), "trend_down")
-        panel.set_trends_enabled(False)
+        panel.trends_enabled = False
         self.assertEqual(panel.trend_style("k", "m", 9.0, "cyan", version=5), "cyan")
 
     def test_line_text(self):
@@ -506,6 +573,8 @@ class TestPanel(unittest.TestCase):
         with self.assertRaises(NotImplementedError):
             panel.render_lines("default", 80)
         panel.observe_sample([], 0)  # default is a no-op
+        panel.handle_key("q")  # default ignores other keys
+        self.assertEqual(panel.key_bindings, ())
 
 
 class TestLiveCollector(TelemetryTestCase):
@@ -518,7 +587,6 @@ class TestLiveCollector(TelemetryTestCase):
         self.assertTrue(collector.accepts_plugin_events)
         self.assertTrue(collector.accepts_sample_timestamp)
         self.assertTrue(collector.show_telemetry_panel)
-        self.assertEqual(collector.telemetry_plugins_for_sampler, [plugin])
         plugin_id, panel = collector._get_current_telemetry_plugin()
         self.assertEqual(plugin_id, "fake_plugin")
         self.assertIsInstance(panel, FakePanel)
@@ -550,6 +618,36 @@ class TestLiveCollector(TelemetryTestCase):
         self.assertEqual(len(panel.samples), 2)
         self.assertGreater(panel.samples[1], panel.samples[0])
 
+    def test_keys_reach_the_panel_after_the_tui(self):
+        from profiling.sampling.live_collector.display import MockDisplay
+
+        display = MockDisplay(height=40, width=160)
+        collector = LiveStatsCollector(1000, pid=1, display=display, telemetry_plugins=[FakePlugin({})])
+        _, panel = collector._get_current_telemetry_plugin()
+        panel.ingest("tick", {})
+        collector.show_telemetry_panel = False  # hidden panels still follow the keys
+        for ch in (ord("x"), ord("z"), ord("p"), 27):
+            display.simulate_input(ch)
+            collector._handle_input()
+        self.assertEqual(panel.keys, ["x", "z", "p", None])
+        self.assertFalse(panel.trends_enabled)   # followed the TUI's x
+        self.assertEqual(panel.events, [])       # the panel's own z binding
+        self.assertTrue(collector.paused)        # and the TUI still handled p
+
+    def test_help_lists_panel_keys(self):
+        from profiling.sampling.live_collector.display import MockDisplay
+
+        display = MockDisplay(height=50, width=120)
+        collector = LiveStatsCollector(1000, pid=1, display=display, telemetry_plugins=[FakePlugin({})])
+        collector._initialize_widgets({})
+        display.simulate_input(ord("h"))
+        collector._handle_input()
+        self.assertTrue(collector.show_help)
+        collector._update_display()
+        text = "\n".join(text for text, _ in display.buffer.values())
+        self.assertIn("Telemetry plugin keys:", text)
+        self.assertIn("zero the counts", text)
+
     def test_widget_renders_panel_lines(self):
         from profiling.sampling.live_collector.widgets import TelemetryPanelWidget
 
@@ -564,13 +662,11 @@ class TestLiveCollector(TelemetryTestCase):
                 self.rows.setdefault(line, []).append((col, text, attr))
 
         collector = self._collector([FakePlugin({})])
-        collector._trend_tracker = types.SimpleNamespace(enabled=True)
         _, panel = collector._get_current_telemetry_plugin()
         panel.ingest("tick", {})
         display = Display()
         widget = TelemetryPanelWidget(display, {"normal_header": 7, "color_samples": 3}, collector)
         end = widget.render(0, 60)
-        self.assertTrue(panel.trends_enabled)
         self.assertEqual(end, 3)  # title + two panel lines
         self.assertIn("Telemetry [fake_plugin] (COUNTS)", display.rows[0][0][1])
         self.assertEqual([(c, s) for c, s, _ in display.rows[1]][:2], [(0, "events "), (7, "1")])
@@ -595,12 +691,14 @@ class TestLiveCollector(TelemetryTestCase):
 
 class TestGeckoExport(TelemetryTestCase):
     def test_clock(self):
-        clock = TelemetryClock(base_monotonic_us=1_000_000, utc_ns=5_000_000_000, monotonic_ns=1_000_000_000)
+        clock = TelemetryClock(
+            base_monotonic_us=1_000_000, utc_ns=5_000_000_000, monotonic_ns=1_000_000_000)
         self.assertEqual(clock.to_ms(5_000_000_000), 0.0)
         self.assertEqual(clock.to_ms(5_010_000_000), 10.0)
         self.assertIsNone(clock.to_ms(None))
         self.assertIsNone(clock.to_ms(0))
-        records = _records("p", ("tick", {}), ("metadata", {"clock": {"utc_ns": 7, "monotonic_ns": 2}}))
+        records = _records(
+            "p", ("tick", {}), ("metadata", {"clock": {"utc_ns": 7, "monotonic_ns": 2}}))
         self.assertEqual(TelemetryClock.from_records(0, records).utc_minus_monotonic_ns, 5)
         self.assertEqual(TelemetryClock.from_records(0, [], (9, 4)).utc_minus_monotonic_ns, 5)
         self.assertIsNone(TelemetryClock.from_records(0, []))
@@ -625,15 +723,16 @@ class TestGeckoExport(TelemetryTestCase):
         utc0, mono0 = collector._telemetry_clock_pair
         start_mono_ns = int(collector.start_time * 1_000_000)
         plugin_id = FAKE_ID
-        collector.set_plugin_enabled(plugin_id)
-        collector.set_plugin_metadata(plugin_id, {"clock": {"utc_ns": utc0, "monotonic_ns": mono0}})
+        collector.collect_plugin_event(
+            plugin_id, "metadata", {"clock": {"utc_ns": utc0, "monotonic_ns": mono0}})
         # Sample one Python thread so a thread marker can land on it.
         frames = [MockInterpreterInfo(0, [MockThreadInfo(555, [MockFrameInfo("f.py", 1, "func")])])]
         collector.collect(frames)
         for i in range(3):
             t_utc = utc0 + (start_mono_ns + (i + 1) * 10_000_000 - mono0)
             tid = 555 if i < 2 else 999  # last one on an unsampled thread
-            collector.collect_plugin_event(plugin_id, "tick", {"t_utc_ns": t_utc, "rate": i, "tid": tid})
+            collector.collect_plugin_event(
+                plugin_id, "tick", {"t_utc_ns": t_utc, "rate": i, "tid": tid})
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, "profile.json")
             collector.export(path)
@@ -649,7 +748,8 @@ class TestGeckoExport(TelemetryTestCase):
         self.assertEqual(threads[f"{FAKE_ID} (other threads)"]["markers"]["length"], 1)
         python_threads = [t for t in profile["threads"] if t.get("tid") == 555]
         self.assertEqual(len(python_threads), 1)
-        python_ticks = [d for d in python_threads[0]["markers"]["data"] if d.get("type") == "FakeTick"]
+        python_ticks = [d for d in python_threads[0]["markers"]["data"]
+                        if d.get("type") == "FakeTick"]
         self.assertEqual(len(python_ticks), 2)
         starts = threads["fake events"]["markers"]["startTime"]
         self.assertEqual([round(s, 3) for s in starts], [10.0, 20.0, 30.0])
@@ -699,13 +799,16 @@ class TestCli(TelemetryTestCase):
         self.assertEqual(cli._telemetry_target_environment(args), {"FAKE_PLUGIN": "1"})
 
     def test_unknown_plugin_flags_not_registered(self):
-        with mock.patch.object(sys, "argv", ["profiling", "run", "--plugin", "no_such_plugin", "x.py"]):
+        argv = ["profiling", "run", "--plugin", "no_such_plugin", "x.py"]
+        with mock.patch.object(sys, "argv", argv):
             parser = argparse.ArgumentParser()
             cli._add_plugin_cli_flags(parser)
-        self.assertEqual(cli._build_telemetry_plugins(types.SimpleNamespace(plugins=["no_such_plugin"])), None)
+        args = types.SimpleNamespace(plugins=["no_such_plugin"])
+        self.assertIsNone(cli._build_telemetry_plugins(args))
 
     def test_unknown_plugin_rejected(self):
-        with mock.patch.object(sys, "argv", ["profiling", "run", "--plugin", "no_such_plugin", "x.py"]), \
+        argv = ["profiling", "run", "--plugin", "no_such_plugin", "x.py"]
+        with mock.patch.object(sys, "argv", argv), \
              mock.patch("sys.stderr", new_callable=io.StringIO) as stderr, \
              self.assertRaises(SystemExit):
             cli.main()
@@ -714,10 +817,11 @@ class TestCli(TelemetryTestCase):
     def test_summary_printing(self):
         buffer = TelemetryRecordBuffer()
         buffer.collect_plugin_event(FAKE_ID, "tick", {})
-        collector = types.SimpleNamespace(telemetry_records=buffer)
+        collector = PstatsCollector(1000)
+        collector.telemetry_records = buffer
         with mock.patch("sys.stdout", new_callable=io.StringIO) as stdout:
             cli._print_telemetry_summary(collector)
-            cli._print_telemetry_summary(types.SimpleNamespace())
+            cli._print_telemetry_summary(PstatsCollector(1000))  # no buffer: prints nothing
         self.assertIn(f"Telemetry [{FAKE_ID}]", stdout.getvalue())
         self.assertIn("1 records, first tick", stdout.getvalue())
 

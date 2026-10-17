@@ -97,18 +97,10 @@ class BinaryCollector(Collector):
 
     accepts_plugin_events = True
 
-    def set_plugin_enabled(self, plugin_id):
-        if plugin_id and self._telemetry_chunk_writer is None:
-            self._telemetry_chunk_writer = TelemetryChunkWriter(self.filename)
-
-    def set_plugin_metadata(self, plugin_id, metadata):
-        if self._telemetry_chunk_writer is None:
-            return
-        self._telemetry_chunk_writer.write_record(plugin_id, "metadata", metadata)
-
     def collect_plugin_event(self, plugin_id, event_type, payload):
+        # The sidecar exists only for captures that had plugin events.
         if self._telemetry_chunk_writer is None:
-            return
+            self._telemetry_chunk_writer = TelemetryChunkWriter(self.filename)
         self._telemetry_chunk_writer.write_record(plugin_id, event_type, payload)
 
     def collect(self, stack_frames, timestamp_us=None):

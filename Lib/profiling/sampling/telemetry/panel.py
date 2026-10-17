@@ -33,14 +33,26 @@ class TelemetryPanel:
     """
 
     panel_modes = ("default",)
+    # Keys the panel acts on in handle_key, as (key, description) pairs, for
+    # the help screen. Keys the TUI itself uses need no listing: they still
+    # reach the panel, after the TUI has acted on them.
+    key_bindings = ()
 
     def __init__(self):
-        self.trends_enabled = False
+        # Trend colours follow the TUI's toggle (x), which handle_key sees.
+        # Starts on, like the TUI's own trend tracker.
+        self.trends_enabled = True
         self._trend_values = {}
 
-    def set_trends_enabled(self, enabled):
-        """Follow the TUI's trend toggle (``x``)."""
-        self.trends_enabled = bool(enabled)
+    def handle_key(self, key):
+        """Called with every key the live TUI receives, after the TUI's own handling.
+
+        ``key`` is the pressed character, or ``None`` for keys with no
+        character (arrows). The base keeps ``trends_enabled`` in step with the
+        TUI's ``x`` toggle; subclasses that override call ``super()``.
+        """
+        if key in ("x", "X"):
+            self.trends_enabled = not self.trends_enabled
 
     def ingest(self, event_type, payload):
         """Consume one helper event."""
@@ -58,10 +70,10 @@ class TelemetryPanel:
     def observe_sample(self, stack_frames, timestamp_ns):
         """Called for every CPU sample.
 
-        ``stack_frames`` is the unwinder result (a list of interpreter infos
-        whose threads carry ``thread_id`` and ``frame_info``) and
-        ``timestamp_ns`` is ``time.perf_counter_ns()`` when the unwind
-        started.
+        ``stack_frames`` is what ``Collector.collect`` receives; walk it with
+        ``iter_thread_frames`` and read frames with ``frame_location`` rather
+        than relying on its structure. ``timestamp_ns`` is
+        ``time.perf_counter_ns()`` when the unwind started.
         """
 
     def trend_style(self, key, metric, value, fallback="normal", version=None):
@@ -98,6 +110,36 @@ class TelemetryPanel:
         if trend == "down":
             return "trend_down"
         return fallback
+
+
+def iter_thread_frames(stack_frames):
+    """Yield ``(thread_id, frames)`` for each sampled thread with a stack.
+
+    ``thread_id`` is the OS thread id (the Linux tid, which helpers can also
+    report) and ``frames`` lists the thread's frames innermost first. This is
+    the supported way to read the sample passed to ``observe_sample``.
+    """
+    for interpreter_info in stack_frames or ():
+        for thread_info in getattr(interpreter_info, "threads", None) or ():
+            thread_id = getattr(thread_info, "thread_id", None)
+            frames = getattr(thread_info, "frame_info", None)
+            if thread_id is not None and frames:
+                yield thread_id, frames
+
+
+def frame_location(frame):
+    """``(funcname, filename, lineno)`` of a frame from ``iter_thread_frames``."""
+    location = getattr(frame, "location", None)
+    if location is None:
+        lineno = getattr(frame, "lineno", 0) or 0
+    elif isinstance(location, int):
+        lineno = location
+    else:
+        try:
+            lineno = int(location[0] or 0)
+        except (TypeError, IndexError, ValueError):
+            lineno = 0
+    return getattr(frame, "funcname", ""), getattr(frame, "filename", ""), lineno
 
 
 def line_text(line):

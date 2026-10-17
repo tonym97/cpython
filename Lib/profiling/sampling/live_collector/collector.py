@@ -182,8 +182,7 @@ class LiveStatsCollector(Collector):
         self.telemetry_plugin_order = []
         self.current_telemetry_plugin_idx = 0
         self.current_telemetry_mode_idx = 0
-        self.telemetry_plugins_for_sampler = list(telemetry_plugins or [])
-        for plugin in self.telemetry_plugins_for_sampler:
+        for plugin in telemetry_plugins or ():
             self._add_panel(plugin.plugin_id, plugin.create_panel())
         self.selected_row = 0  # Currently selected row in table for opcode view
         self.scroll_offset = 0  # Scroll offset for table when in opcode mode
@@ -526,7 +525,10 @@ class LiveStatsCollector(Collector):
 
             # Show help screen if requested
             if self.show_help:
-                self.help_widget.render(0, width, height=height)
+                _, panel = self._get_current_telemetry_plugin()
+                self.help_widget.render(
+                    0, width, height=height,
+                    telemetry_keys=list(panel.key_bindings) if panel is not None else [])
                 self.display.refresh()
                 return
 
@@ -1066,8 +1068,23 @@ class LiveStatsCollector(Collector):
             # Navigate to next thread
             self._navigate_to_next_thread()
 
+        if ch != -1:
+            self._dispatch_key_to_telemetry(ch)
+
         # Update display if input was processed while finished
         self._handle_finished_input_update(ch != -1)
+
+    def _dispatch_key_to_telemetry(self, ch):
+        """Hand the key to every telemetry panel, shown or not.
+
+        Every panel sees every key so each tracks state (trend toggle, reset)
+        even while hidden or not the current plugin. The TUI has already
+        acted on the key, so a panel can only add behaviour, never override
+        the TUI's keys.
+        """
+        key = chr(ch) if 32 <= ch < 127 else None
+        for panel in self.telemetry_panels.values():
+            panel.handle_key(key)
 
     def init_curses(self, stdscr):
         """Initialize curses display and suppress stdout/stderr."""
@@ -1151,18 +1168,14 @@ class LiveStatsCollector(Collector):
         self.telemetry_panels[plugin_id] = panel
         self.telemetry_plugin_order.append(plugin_id)
 
-    def set_plugin_enabled(self, plugin_id):
-        """Events will arrive for ``plugin_id``; create its panel if we have none."""
-        if plugin_id in self.telemetry_panels:
-            return
-        plugin = make_plugin(plugin_id)
-        if plugin is not None:
-            self._add_panel(plugin_id, plugin.create_panel())
-
     def collect_plugin_event(self, plugin_id, event_type, payload):
         panel = self.telemetry_panels.get(plugin_id)
         if panel is None:
-            self.set_plugin_enabled(plugin_id)
+            # Events from a plugin that was not named on the command line
+            # (a replayed sidecar, for example): give it a panel if we can.
+            plugin = make_plugin(plugin_id)
+            if plugin is not None:
+                self._add_panel(plugin_id, plugin.create_panel())
             panel = self.telemetry_panels.get(plugin_id)
         if panel is not None:
             panel.ingest(event_type, payload)
@@ -1178,13 +1191,12 @@ class LiveStatsCollector(Collector):
         _, panel = self._get_current_telemetry_plugin()
         if panel is None:
             return
-        modes = list(panel.panel_modes)
-        if not modes:
-            return
+        modes = list(panel.panel_modes) or ["default"]
         self.current_telemetry_mode_idx = (self.current_telemetry_mode_idx + 1) % len(modes)
 
     def _cycle_telemetry_plugin(self):
         if not self.telemetry_plugin_order:
             return
-        self.current_telemetry_plugin_idx = (self.current_telemetry_plugin_idx + 1) % len(self.telemetry_plugin_order)
+        self.current_telemetry_plugin_idx = (
+            (self.current_telemetry_plugin_idx + 1) % len(self.telemetry_plugin_order))
         self.current_telemetry_mode_idx = 0

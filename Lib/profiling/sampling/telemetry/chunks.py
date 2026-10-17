@@ -1,11 +1,14 @@
 """Sidecar file for plugin events captured alongside a binary profile.
 
 ``<binary>.telemetrychunks`` holds a magic header line followed by one JSON
-record per line: ``{"plugin": id, "event_type": str, "payload": {...}}``.
+record per line in the helper wire format:
+``{"v": 1, "plugin": id, "event_type": str, "payload": {...}}``.
 """
 
 import json
 import os
+
+from .records import PROTOCOL_VERSION
 
 _MAGIC = "TCHUNK1"
 
@@ -22,6 +25,7 @@ class TelemetryChunkWriter:
 
     def write_record(self, plugin_id, event_type, payload):
         record = {
+            "v": PROTOCOL_VERSION,
             "plugin": plugin_id,
             "event_type": event_type,
             "payload": payload,

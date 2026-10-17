@@ -9,7 +9,7 @@ import threading
 import time
 
 from .collector import Collector, filter_internal_frames
-from .telemetry.gecko import TelemetryClock
+from .telemetry.gecko import GECKO_FIELD_FORMATS, GECKO_GRAPH_COLORS, TelemetryClock
 from .telemetry.plugin_registry import make_plugin
 from .telemetry.records import TelemetryRecordBuffer
 from .opcode_utils import get_opcode_info, format_opcode
@@ -50,15 +50,6 @@ CATEGORY_CODE_TYPE = 6
 CATEGORY_OPCODES = 7
 CATEGORY_EXCEPTION = 8
 CATEGORY_TELEMETRY = 9
-
-# Firefox Profiler accepts only these graph colours and marker field formats;
-# anything else makes it reject the whole profile.
-GECKO_GRAPH_COLORS = frozenset({"blue", "green", "grey", "ink", "magenta", "orange", "purple", "red", "teal", "yellow"})
-GECKO_FIELD_FORMATS = frozenset({
-    "url", "file-path", "sanitized-string", "string", "unique-string", "duration", "time", "seconds",
-    "milliseconds", "microseconds", "nanoseconds", "bytes", "percentage", "integer", "decimal",
-    "flow-id", "terminating-flow-id", "list", "pid", "tid",
-})
 
 
 def _graph_color(color):
@@ -218,12 +209,6 @@ class GeckoCollector(Collector):
 
     accepts_plugin_events = True
 
-    def set_plugin_enabled(self, plugin_id):
-        self._telemetry.set_plugin_enabled(plugin_id)
-
-    def set_plugin_metadata(self, plugin_id, metadata):
-        self._telemetry.set_plugin_metadata(plugin_id, metadata)
-
     def collect_plugin_event(self, plugin_id, event_type, payload):
         self._telemetry.collect_plugin_event(plugin_id, event_type, payload)
 
@@ -282,7 +267,8 @@ class GeckoCollector(Collector):
             for track in contribution.tracks:
                 tid = self._new_track_thread(track.name, track.process_name)
                 for marker in track.markers:
-                    self._append_marker(tid, marker.name, marker.start_ms, marker.end_ms, marker.data)
+                    self._append_marker(
+                        tid, marker.name, marker.start_ms, marker.end_ms, marker.data)
             fallback_tid = None
             for marker in contribution.thread_markers:
                 tid = marker.tid
