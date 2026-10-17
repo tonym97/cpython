@@ -7,7 +7,7 @@ resolved in this order:
    ``plugin_id``;
 2. an installed package that registers the id in the
    ``profiling.sampling.telemetry`` entry point group, for example
-   ``nvidia_gpu = my_plugin_package:PLUGIN`` in its project metadata;
+   ``my_plugin = my_plugin_package:PLUGIN`` in its project metadata;
 3. the dotted path of any importable module (``--plugin
    my_company.tachyon_plugin``), which provides its plugin as a
    ``TelemetryPlugin`` subclass named ``PLUGIN``.
