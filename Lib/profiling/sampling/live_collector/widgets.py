@@ -907,7 +907,15 @@ class FooterWidget(Widget):
         if self.collector.finished:
             footer = f"{status_str}"
         else:
-            footer = f"{status_str}Sort: {sort_display} | 't':mode 'x':trends 'g':panel 'n':plugin 'm':mode ←→:thread 'h':help 'q':quit"
+            footer = f"{status_str}Sort: {sort_display} | 't':mode 'x':trends 'g':panel 'n':plugin 'm':mode"
+            # The shown plugin's own keys with their one-word labels: 'e':fold.
+            if self.collector.show_telemetry_panel:
+                _, panel = self.collector._get_current_telemetry_plugin()
+                for binding in (panel.key_bindings if panel is not None else ()):
+                    key, description = binding[0], binding[1]
+                    label = binding[2] if len(binding) > 2 else description.split()[0]
+                    footer += f" '{key}':{label}"
+            footer += " ←→:thread 'h':help 'q':quit"
         self.add_str(
             line,
             0,
@@ -959,6 +967,19 @@ class HelpWidget(Widget):
             ("  g           - Toggle telemetry panel", A_NORMAL),
             ("  n           - Cycle telemetry plugin", A_NORMAL),
             ("  m           - Cycle telemetry plugin mode", A_NORMAL),
+        ]
+        # The current plugin's own keys sit next to the telemetry keys they
+        # extend, under the plugin's name, so they are found where g/n/m are.
+        telemetry_keys = kwargs.get("telemetry_keys") or []
+        if telemetry_keys:
+            plugin_id = kwargs.get("telemetry_plugin")
+            title = f"Telemetry plugin keys ({plugin_id}):" if plugin_id else "Telemetry plugin keys:"
+            help_lines += [("", A_NORMAL), (title, A_BOLD)]
+            for key, description, *_ in telemetry_keys:
+                help_lines.append((f"  {key:<11} - {description}", A_NORMAL))
+            help_lines.append(("", A_NORMAL))
+            help_lines.append(("Navigation (continued):", A_BOLD))
+        help_lines += [
             ("  j/k or ↑/↓  - Select next/previous function (--opcodes)", A_NORMAL),
             ("  ← / →       - Cycle through threads", A_NORMAL),
             ("  +           - Faster display refresh rate", A_NORMAL),
@@ -974,12 +995,6 @@ class HelpWidget(Widget):
             ("  ESC         - Cancel filter input", A_NORMAL),
             ("", A_NORMAL),
         ]
-        telemetry_keys = kwargs.get("telemetry_keys") or []
-        if telemetry_keys:
-            help_lines.append(("Telemetry plugin keys:", A_BOLD))
-            for key, description in telemetry_keys:
-                help_lines.append((f"  {key:<11} - {description}", A_NORMAL))
-            help_lines.append(("", A_NORMAL))
         help_lines += [
             ("Other:", A_BOLD),
             ("  h or ?      - Show/hide this help", A_NORMAL),
@@ -988,7 +1003,7 @@ class HelpWidget(Widget):
             ("Press any key to close this help screen", A_BOLD),
         ]
 
-        start_line = (height - len(help_lines)) // 2
+        start_line = max(0, (height - len(help_lines)) // 2)
         for i, (text, attr) in enumerate(help_lines):
             if start_line + i < height - 1:
                 col = 2  # Left-align with small margin

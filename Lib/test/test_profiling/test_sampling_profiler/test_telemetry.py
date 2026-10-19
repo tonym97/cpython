@@ -645,8 +645,45 @@ class TestLiveCollector(TelemetryTestCase):
         self.assertTrue(collector.show_help)
         collector._update_display()
         text = "\n".join(text for text, _ in display.buffer.values())
-        self.assertIn("Telemetry plugin keys:", text)
+        self.assertIn("Telemetry plugin keys (fake_plugin):", text)
         self.assertIn("zero the counts", text)
+        # Next to the TUI's own telemetry keys, not at the end of the screen.
+        self.assertLess(text.index("Cycle telemetry plugin mode"), text.index("zero the counts"))
+        self.assertLess(text.index("zero the counts"), text.index("Control:"))
+
+    def test_help_keeps_its_top_on_a_short_terminal(self):
+        from profiling.sampling.live_collector.display import MockDisplay
+
+        display = MockDisplay(height=24, width=120)
+        collector = LiveStatsCollector(1000, pid=1, display=display, telemetry_plugins=[FakePlugin({})])
+        collector._initialize_widgets({})
+        collector.show_help = True
+        collector._update_display()
+        text = "\n".join(text for text, _ in display.buffer.values())
+        self.assertIn("Tachyon Profiler - Interactive Commands", text)
+        self.assertIn("Telemetry plugin keys (fake_plugin):", text)
+
+    def test_footer_names_the_panel_keys(self):
+        from profiling.sampling.live_collector.display import MockDisplay
+
+        display = MockDisplay(height=50, width=200)
+        collector = LiveStatsCollector(1000, pid=1, display=display, telemetry_plugins=[FakePlugin({})])
+        collector._initialize_widgets(collector._setup_colors())
+
+        def footer():
+            display.clear()
+            collector.footer_widget.render(48, 200)
+            return "\n".join(text for text, _ in display.buffer.values())
+
+        # No label in the binding: the description's first word.
+        self.assertIn("'m':mode 'z':zero ←→:thread", footer())
+        display.simulate_input(ord("g"))      # panel hidden: its keys leave the footer
+        collector._handle_input()
+        self.assertNotIn("'z':zero", footer())
+        collector.show_telemetry_panel = True
+        panel = collector.telemetry_panels["fake_plugin"]
+        with mock.patch.object(type(panel), "key_bindings", (("z", "zero the counts", "reset"),)):
+            self.assertIn("'z':reset ←→:thread", footer())
 
     def test_widget_renders_panel_lines(self):
         from profiling.sampling.live_collector.widgets import TelemetryPanelWidget

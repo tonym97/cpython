@@ -525,9 +525,9 @@ class LiveStatsCollector(Collector):
 
             # Show help screen if requested
             if self.show_help:
-                _, panel = self._get_current_telemetry_plugin()
+                plugin_id, panel = self._get_current_telemetry_plugin()
                 self.help_widget.render(
-                    0, width, height=height,
+                    0, width, height=height, telemetry_plugin=plugin_id,
                     telemetry_keys=list(panel.key_bindings) if panel is not None else [])
                 self.display.refresh()
                 return

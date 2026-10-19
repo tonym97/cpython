@@ -20,11 +20,13 @@ that turn those events into output.
 2. `SampleProfiler` adds `target_pid` to each plugin's config and creates one
    `TelemetryHelperManager` per plugin with `plugin.helper_argv()`: the
    plugin's native `helper_command` when it has one, otherwise
-   `python -m profiling.sampling.telemetry --plugin <id>`, which runs the
-   plugin's `run_helper`.
+   `python -m profiling.sampling.telemetry --plugin <id> --config-json <config>`,
+   which instantiates the plugin with that config (so the helper sees
+   `target_pid`) and runs its `run_helper`.
 3. The helper writes JSON lines `{"v": 1, "plugin", "event_type", "payload"}`
-   on stdout (`v` is `PROTOCOL_VERSION`; a newer version is reported once as a
-   `health` warning). A reader thread parses them into a bounded queue; the
+   on stdout (`v` is `PROTOCOL_VERSION`; a record whose `v` differs from it is
+   reported once as a `health` warning and still delivered; records without
+   `v` are version 1). A reader thread parses them into a bounded queue; the
    sampling loop drains the queue after each sample without blocking.
 4. Events reach the collector through `collect_plugin_event(plugin_id,
    event_type, payload)`, the one method of the collector contract. Every
@@ -153,8 +155,12 @@ PLUGIN = CounterPlugin
   is the character, or `None` for arrows. The TUI's own keys cannot be
   overridden, only followed: the base class flips `trends_enabled` on `x`,
   and a panel can reset its cumulative state on `r` the way the CPU table
-  does. `key_bindings`, `(key, description)` pairs for the panel's own keys,
-  appears on the help screen (`h`).
+  does. `key_bindings`, `(key, description)` or `(key, description, label)`
+  tuples for the panel's own keys: the description appears on the help
+  screen (`h`) under the plugin's name, next to the TUI's telemetry keys,
+  and the label (one word; default: the description's first word) tags the
+  key in the footer (`'e':fold`) while the panel is shown. Keep the
+  description to one short line; the help screen does not wrap.
 - `trends_enabled`: starts on, like the TUI's trend tracker, and follows `x`.
   `trend_style(key, metric, value, fallback, version)` tracks a
   numeric cell across renders and returns the trend style when it moved and
@@ -201,7 +207,10 @@ takes `timestamp_us`, the sampler's unwind-start time).
 - `g` toggles the telemetry panel, `n` cycles plugins, `m` cycles the current
   plugin's panels. Every key also reaches every panel's `handle_key` after
   the TUI, so `x` and `r` apply to all of them and a panel can add keys of
-  its own, listed under "Telemetry plugin keys" in the help screen.
+  its own, shown in the footer as `'key':label` and listed under
+  "Telemetry plugin keys (plugin_id)" in the help screen, right after the
+  `g`/`n`/`m` lines. The help screen clips at the bottom on a short
+  terminal, never at the top.
 - The panel is `TELEMETRY_PANEL_HEIGHT` lines (title plus plugin lines).
 
 ---

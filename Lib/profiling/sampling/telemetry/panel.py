@@ -33,9 +33,11 @@ class TelemetryPanel:
     """
 
     panel_modes = ("default",)
-    # Keys the panel acts on in handle_key, as (key, description) pairs, for
-    # the help screen. Keys the TUI itself uses need no listing: they still
-    # reach the panel, after the TUI has acted on them.
+    # Keys the panel acts on in handle_key, as (key, description) or
+    # (key, description, label) tuples: the description goes on the help
+    # screen, the label (one word; default: the description's first word)
+    # tags the key in the footer as 'e':label. Keys the TUI itself uses need
+    # no listing: they still reach the panel, after the TUI has acted on them.
     key_bindings = ()
 
     def __init__(self):
