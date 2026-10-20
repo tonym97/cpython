@@ -5,6 +5,7 @@ helper process that is plain Python printing JSON lines.
 """
 
 import argparse
+import contextlib
 import io
 import json
 import os
@@ -155,6 +156,25 @@ FAKES_PACKAGE = "test_telemetry_fakes"
 FAKE_ID = FAKES_PACKAGE + ".fake"
 
 
+@contextlib.contextmanager
+def _broken_plugin_module(tmp, message):
+    """A real package on disk whose plugin module raises at import; yields its dotted name."""
+    package = pathlib.Path(tmp, "broken_telemetry_pkg")
+    package.mkdir()
+    package.joinpath("__init__.py").write_text("")
+    package.joinpath("boom.py").write_text(f"raise RuntimeError({message!r})\n")
+    name = "broken_telemetry_pkg.boom"
+    sys.path.insert(0, tmp)
+    try:
+        yield name
+    finally:
+        sys.path.remove(tmp)
+        for key in list(sys.modules):
+            if key.startswith("broken_telemetry_pkg"):
+                del sys.modules[key]
+        plugin_registry._LOAD_ERRORS.pop(name, None)
+
+
 def _install_module(name, **attrs):
     """Register ``name`` (dotted, under FAKES_PACKAGE) as an importable module."""
     if FAKES_PACKAGE not in sys.modules:
@@ -203,6 +223,15 @@ class TestPluginRegistry(TelemetryTestCase):
         self.assertIsNone(get_plugin_class("no.such.module_for_telemetry"))
         self.assertIsNone(make_plugin(""))
         self.assertFalse(is_known_plugin("no_such_plugin"))
+
+    def test_broken_module_is_unknown_with_a_cause(self):
+        from profiling.sampling.telemetry.plugin_registry import plugin_load_error
+        with tempfile.TemporaryDirectory() as tmp, _broken_plugin_module(tmp, "boom at import") as name:
+            self.assertIsNone(get_plugin_class(name))
+            self.assertIn("boom at import", plugin_load_error(name))
+            # A module that simply does not exist has no cause to report.
+            self.assertIsNone(get_plugin_class("no.such.module_for_telemetry"))
+            self.assertIsNone(plugin_load_error("no.such.module_for_telemetry"))
 
     def test_plugin_class_without_id_gets_module_name(self):
         class Anonymous(TelemetryPlugin):
@@ -348,6 +377,27 @@ class TestHelperManager(unittest.TestCase):
         # The events themselves still arrive.
         self.assertEqual([e["payload"]["i"] for e in events if e["event_type"] == "tick"], [0, 1])
 
+    def test_record_without_version_is_version_one(self):
+        script = textwrap.dedent("""
+            import json
+            print(json.dumps({"plugin": "p", "event_type": "tick", "payload": {"i": 0}}), flush=True)
+            print(json.dumps({"v": 0, "plugin": "p", "event_type": "tick", "payload": {"i": 1}}), flush=True)
+            print(json.dumps({"v": 0, "plugin": "p", "event_type": "tick", "payload": {"i": 2}}), flush=True)
+        """)
+        manager = TelemetryHelperManager("p", [sys.executable, "-c", script])
+        manager.start()
+        deadline = time.monotonic() + 30
+        while manager.alive and time.monotonic() < deadline:
+            time.sleep(0.01)
+        manager.stop()
+        events = manager.poll()
+        warnings = [e for e in events
+                    if e["event_type"] == "health" and e["payload"]["helper"] == "warning"]
+        # No warning for the record without v (read as v1); one for v0, however many records.
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("protocol v0", warnings[0]["payload"]["notes"][0])
+        self.assertEqual([e["payload"]["i"] for e in events if e["event_type"] == "tick"], [0, 1, 2])
+
     def test_python_helper_emits_protocol_version(self):
         # A real plugin module on disk, since the helper is a separate process.
         with tempfile.TemporaryDirectory() as tmp:
@@ -375,6 +425,31 @@ class TestHelperManager(unittest.TestCase):
         self.assertTrue(all(r["v"] == PROTOCOL_VERSION for r in records))
         self.assertEqual(records[0]["payload"], {"pid": 7})
         self.assertEqual(records[1]["payload"]["helper"], "finished")
+
+    def test_run_helper_error_is_reported(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            package = pathlib.Path(tmp, "tmp_telemetry_pkg_err")
+            package.mkdir()
+            package.joinpath("__init__.py").write_text("")
+            package.joinpath("plugin.py").write_text(textwrap.dedent("""
+                from profiling.sampling.telemetry import TelemetryPlugin
+
+                class Plugin(TelemetryPlugin):
+                    plugin_id = "tmp_plugin_err"
+
+                    def run_helper(self, emit):
+                        raise RuntimeError("helper blew up")
+
+                PLUGIN = Plugin
+            """))
+            command = [sys.executable, "-m", "profiling.sampling.telemetry",
+                       "--plugin", "tmp_telemetry_pkg_err.plugin", "--config-json", "{}"]
+            env = dict(os.environ, PYTHONPATH=tmp + os.pathsep + os.environ.get("PYTHONPATH", ""))
+            proc = subprocess.run(command, capture_output=True, text=True, timeout=60, env=env)
+        records = [json.loads(line) for line in proc.stdout.splitlines() if line.strip()]
+        self.assertEqual(records[-1]["event_type"], "health")
+        self.assertEqual(records[-1]["payload"]["helper"], "error")
+        self.assertIn("helper blew up", json.dumps(records[-1]["payload"]))
 
     def test_queue_overflow_is_reported(self):
         manager = TelemetryHelperManager("p", ["unused"])
@@ -634,6 +709,26 @@ class TestLiveCollector(TelemetryTestCase):
         self.assertEqual(panel.events, [])       # the panel's own z binding
         self.assertTrue(collector.paused)        # and the TUI still handled p
 
+    def test_help_and_filter_keys_stay_with_the_tui(self):
+        from profiling.sampling.live_collector.display import MockDisplay
+
+        display = MockDisplay(height=40, width=160)
+        collector = LiveStatsCollector(1000, pid=1, display=display, telemetry_plugins=[FakePlugin({})])
+        _, panel = collector._get_current_telemetry_plugin()
+        # h opens the help screen; the next key closes it; neither reaches the panel.
+        for ch in (ord("h"), ord("z")):
+            display.simulate_input(ch)
+            collector._handle_input()
+        self.assertFalse(collector.show_help)
+        self.assertEqual(panel.keys, [])
+        # `/` is a command and reaches the panel; what is typed into the
+        # filter prompt afterwards stays in the prompt.
+        for ch in (ord("/"), ord("z"), ord("x"), 27):
+            display.simulate_input(ch)
+            collector._handle_input()
+        self.assertEqual(panel.keys, ["/"])
+        self.assertTrue(panel.trends_enabled)
+
     def test_help_lists_panel_keys(self):
         from profiling.sampling.live_collector.display import MockDisplay
 
@@ -663,6 +758,18 @@ class TestLiveCollector(TelemetryTestCase):
         self.assertIn("Tachyon Profiler - Interactive Commands", text)
         self.assertIn("Telemetry plugin keys (fake_plugin):", text)
 
+    def test_footer_hides_telemetry_keys_without_plugins(self):
+        from profiling.sampling.live_collector.display import MockDisplay
+
+        display = MockDisplay(height=50, width=200)
+        collector = LiveStatsCollector(1000, pid=1, display=display)
+        collector._initialize_widgets(collector._setup_colors())
+        collector.footer_widget.render(48, 200)
+        text = "\n".join(text for text, _ in display.buffer.values())
+        self.assertIn("'x':trends ←→:thread", text)
+        for key in ("'g':panel", "'n':plugin", "'m':mode"):
+            self.assertNotIn(key, text)
+
     def test_footer_names_the_panel_keys(self):
         from profiling.sampling.live_collector.display import MockDisplay
 
@@ -676,7 +783,7 @@ class TestLiveCollector(TelemetryTestCase):
             return "\n".join(text for text, _ in display.buffer.values())
 
         # No label in the binding: the description's first word.
-        self.assertIn("'m':mode 'z':zero ←→:thread", footer())
+        self.assertIn("'g':panel 'n':plugin 'm':mode 'z':zero ←→:thread", footer())
         display.simulate_input(ord("g"))      # panel hidden: its keys leave the footer
         collector._handle_input()
         self.assertNotIn("'z':zero", footer())
@@ -684,6 +791,48 @@ class TestLiveCollector(TelemetryTestCase):
         panel = collector.telemetry_panels["fake_plugin"]
         with mock.patch.object(type(panel), "key_bindings", (("z", "zero the counts", "reset"),)):
             self.assertIn("'z':reset ←→:thread", footer())
+
+    def test_telemetry_area_grows_with_the_terminal(self):
+        from profiling.sampling.live_collector.widgets import TelemetryPanelWidget
+        from profiling.sampling.live_collector.constants import TELEMETRY_PANEL_HEIGHT
+
+        class Display:
+            def __init__(self):
+                self.rows = {}
+
+            def get_attr(self, name):
+                return 0
+
+            def add_str(self, line, col, text, attr=0):
+                self.rows.setdefault(line, []).append((col, text, attr))
+
+        class TallPanel(FakePanel):
+            def render_lines(self, mode, width):
+                return [f"row {i} of {self.max_lines}" for i in range(40)]
+
+        collector = self._collector([FakePlugin({})])
+        # 30 rows hold header, footer, three CPU rows and the 12-line area.
+        self.assertEqual(collector.telemetry_panel_height(30), TELEMETRY_PANEL_HEIGHT)
+        self.assertEqual(collector.telemetry_panel_height(60), 20)       # a third
+        self.assertEqual(collector.telemetry_panel_height(24), 8)        # shrinks to fit
+        self.assertEqual(collector.telemetry_panel_height(12), 3)        # never below title + 2
+        plugin_id, _ = collector._get_current_telemetry_plugin()
+        collector.telemetry_panels[plugin_id] = TallPanel()
+        display = Display()
+        widget = TelemetryPanelWidget(display, {}, collector)
+        # 30 rows: the 12-line area, 11 panel lines, and the panel was told so.
+        self.assertEqual(widget.render(0, 60, height=30), 12)
+        self.assertEqual(display.rows[1][0][1], "row 0 of 11")
+        # 24 rows: 8 lines, 7 for the panel, nothing drawn past them.
+        display.rows.clear()
+        self.assertEqual(widget.render(0, 60, height=24), 8)
+        self.assertEqual(display.rows[1][0][1], "row 0 of 7")
+        self.assertEqual(len(display.rows), 8)
+        # 60 rows: a third of the terminal, 19 panel lines.
+        display.rows.clear()
+        self.assertEqual(widget.render(0, 60, height=60), 20)
+        self.assertEqual(display.rows[1][0][1], "row 0 of 19")
+        self.assertEqual(len(display.rows), 20)
 
     def test_widget_renders_panel_lines(self):
         from profiling.sampling.live_collector.widgets import TelemetryPanelWidget
@@ -850,6 +999,32 @@ class TestCli(TelemetryTestCase):
              self.assertRaises(SystemExit):
             cli.main()
         self.assertIn("no_such_plugin", stderr.getvalue())
+
+    def test_broken_plugin_error_names_the_cause(self):
+        with tempfile.TemporaryDirectory() as tmp, _broken_plugin_module(tmp, "cli boom") as name:
+            argv = ["profiling", "run", "--plugin", name, "x.py"]
+            with mock.patch.object(sys, "argv", argv), \
+                 mock.patch("sys.stderr", new_callable=io.StringIO) as stderr, \
+                 self.assertRaises(SystemExit):
+                cli.main()
+        self.assertIn("failed to load", stderr.getvalue())
+        self.assertIn("cli boom", stderr.getvalue())
+        self.assertIn("known plugins:", stderr.getvalue())
+
+    def test_child_profiler_args_carry_plugin_options(self):
+        args = argparse.Namespace(
+            sample_interval_usec=1000, duration=None, all_threads=False, realtime_stats=False,
+            native=False, gc=True, opcodes=False, async_aware=False, mode="wall", format="pstats",
+            plugins=[FAKE_ID], fake_plugin_rate=11, fake_plugin_flag=True)
+        child = cli._build_child_profiler_args(args)
+        i = child.index("--plugin")
+        self.assertEqual(child[i:i + 5], ["--plugin", FAKE_ID, "--fake-plugin-rate", "11", "--fake-plugin-flag"])
+        # Defaults are not repeated.
+        args.fake_plugin_flag = False
+        del args.fake_plugin_rate
+        child = cli._build_child_profiler_args(args)
+        self.assertEqual([t for t in child if t.startswith("--fake-plugin")], [])
+        self.assertEqual(child[child.index("--plugin"):], ["--plugin", FAKE_ID])
 
     def test_summary_printing(self):
         buffer = TelemetryRecordBuffer()

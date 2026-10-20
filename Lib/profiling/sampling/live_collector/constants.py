@@ -47,7 +47,9 @@ FINISHED_BANNER_EXTRA_LINES = 3  # Blank line + banner + blank line
 
 # Panel display
 OPCODE_PANEL_HEIGHT = 12  # Height reserved for opcode statistics panel
-TELEMETRY_PANEL_HEIGHT = 12  # Height reserved for telemetry plugin panel
+TELEMETRY_PANEL_HEIGHT = 12  # Telemetry area (title + plugin lines) when the terminal has room
+TELEMETRY_PANEL_MIN_HEIGHT = 3  # Title plus two plugin lines on the shortest terminals
+MIN_STATS_LINES_WITH_TELEMETRY = 3  # CPU table rows kept when the telemetry area is shown
 
 # Color pair IDs
 COLOR_PAIR_SAMPLES = 1

@@ -14,9 +14,13 @@ that turn those events into output.
 1. The CLI enables plugins with repeatable `--plugin <id>`; `<id>` is a bundled
    plugin's id, an id an installed package registers in the
    `profiling.sampling.telemetry` entry point group, or an importable dotted
-   module path. It instantiates each plugin class with its resolved
-   configuration (`default_config` merged with the plugin's own command line
-   options).
+   module path (it must contain a dot). An unknown id is a parse error that
+   lists the known ids and, when the id named a module or entry point that
+   raised while loading, the exception text. The CLI instantiates each
+   plugin class with its resolved configuration (`default_config` merged
+   with the plugin's own command line options). With `--subprocesses`, each
+   child profiler is started with the same `--plugin` ids and the tokens
+   that reproduce the parent's values of their options.
 2. `SampleProfiler` adds `target_pid` to each plugin's config and creates one
    `TelemetryHelperManager` per plugin with `plugin.helper_argv()`: the
    plugin's native `helper_command` when it has one, otherwise
@@ -159,7 +163,7 @@ PLUGIN = CounterPlugin
   tuples for the panel's own keys: the description appears on the help
   screen (`h`) under the plugin's name, next to the TUI's telemetry keys,
   and the label (one word; default: the description's first word) tags the
-  key in the footer (`'e':fold`) while the panel is shown. Keep the
+  key in the footer (`'e':collapse`) while the panel is shown. Keep the
   description to one short line; the help screen does not wrap.
 - `trends_enabled`: starts on, like the TUI's trend tracker, and follows `x`.
   `trend_style(key, metric, value, fallback, version)` tracks a
@@ -209,9 +213,16 @@ takes `timestamp_us`, the sampler's unwind-start time).
   the TUI, so `x` and `r` apply to all of them and a panel can add keys of
   its own, shown in the footer as `'key':label` and listed under
   "Telemetry plugin keys (plugin_id)" in the help screen, right after the
-  `g`/`n`/`m` lines. The help screen clips at the bottom on a short
+  `g`/`n`/`m` lines. The footer shows `g`/`n`/`m` only while a plugin is
+  loaded. Keys the filter prompt and the help screen consume are not
+  forwarded to panels. The help screen clips at the bottom on a short
   terminal, never at the top.
-- The panel is `TELEMETRY_PANEL_HEIGHT` lines (title plus plugin lines).
+- The telemetry area is `TELEMETRY_PANEL_HEIGHT` (12) lines or a third of the
+  terminal, whichever is more, shrunk on short terminals so the header,
+  three CPU rows and the footer stay on screen (never below a title and two
+  plugin lines): a title line plus plugin lines. Before each render the TUI
+  sets `panel.max_lines` to the number of plugin lines it will draw, so a
+  panel can size its tables; lines beyond that are not drawn.
 
 ---
 

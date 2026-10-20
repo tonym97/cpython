@@ -28,6 +28,7 @@ from .telemetry.plugin_registry import (
     is_known_plugin,
     list_plugin_ids,
     make_plugin,
+    plugin_load_error,
 )
 from .telemetry.records import TelemetryRecordBuffer
 from .telemetry.summary import summary_lines
@@ -178,10 +179,12 @@ def _build_child_profiler_args(args):
     if mode != "wall":
         child_args.extend(["--mode", mode])
 
-    # Generic telemetry plugin options
+    # Telemetry plugins, with the options the user gave them, so a child
+    # profiler runs each plugin the way the parent does.
     child_plugins = getattr(args, "plugins", None) or []
     for plugin_id in child_plugins:
         child_args.extend(["--plugin", plugin_id])
+        child_args.extend(_plugin_option_tokens(plugin_id, args))
 
     # Format options (skip pstats as it's the default)
     if args.format == "diff_flamegraph":
@@ -454,8 +457,8 @@ def _add_sampling_options(parser):
         dest="plugins",
         action="append",
         default=[],
-        help="Enable a telemetry plugin: a bundled id or an importable dotted "
-             "module path (repeatable)",
+        help="Enable a telemetry plugin: a bundled id, an installed plugin's "
+             "entry point id, or an importable dotted module path (repeatable)",
     )
     _add_plugin_cli_flags(parser)
 
@@ -470,6 +473,40 @@ def _plugins_named_on_command_line(argv=None):
         elif token.startswith("--plugin="):
             found.append(token.partition("=")[2])
     return list(dict.fromkeys(found))
+
+
+def _plugin_option_tokens(plugin_id, args):
+    """The command line tokens that reproduce ``args``' values of a plugin's options.
+
+    The plugin's ``register_cli_flags`` is replayed into a scratch parser to
+    learn its options; every option whose value in ``args`` differs from the
+    option's default is emitted as ``--flag`` (store_true/false) or
+    ``--flag value``.
+    """
+    plugin_class = get_plugin_class(plugin_id)
+    if plugin_class is None:
+        return []
+    scratch = argparse.ArgumentParser(add_help=False)
+    plugin_class.register_cli_flags(scratch)
+    tokens = []
+    for action in scratch._actions:
+        if not action.option_strings:
+            continue
+        value = getattr(args, action.dest, argparse.SUPPRESS)
+        if value is argparse.SUPPRESS or value is None or value == action.default:
+            continue
+        flag = action.option_strings[-1]
+        if isinstance(action, (argparse._StoreTrueAction, argparse._StoreFalseAction)):
+            tokens.append(flag)
+        elif isinstance(action, argparse._AppendAction):
+            for item in value:
+                tokens.extend([flag, str(item)])
+        elif action.nargs in (None, 1, "?"):
+            tokens.extend([flag, str(value)])
+        else:
+            tokens.append(flag)
+            tokens.extend(str(item) for item in value)
+    return tokens
 
 
 def _add_plugin_cli_flags(parser):
@@ -948,10 +985,12 @@ def _validate_args(args, parser):
         args.plugins = list(dict.fromkeys(args.plugins))
         for plugin_id in args.plugins:
             if not is_known_plugin(plugin_id):
-                bundled = ", ".join(list_plugin_ids()) or "none"
+                known = ", ".join(list_plugin_ids()) or "none"
+                cause = plugin_load_error(plugin_id)
+                detail = (f"it failed to load: {cause}" if cause
+                          else "or give an importable dotted module path")
                 parser.error(
-                    f"Unknown telemetry plugin {plugin_id!r} (bundled plugins: {bundled}; "
-                    "or give an importable dotted module path)")
+                    f"Unknown telemetry plugin {plugin_id!r} (known plugins: {known}; {detail})")
 
     # Check if live mode is available
     if hasattr(args, 'live') and args.live and LiveStatsCollector is None:

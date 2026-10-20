@@ -41,6 +41,8 @@ from .constants import (
     COLOR_PAIR_RED,
     COLOR_PAIR_SORTED_HEADER,
     TELEMETRY_PANEL_HEIGHT,
+    TELEMETRY_PANEL_MIN_HEIGHT,
+    MIN_STATS_LINES_WITH_TELEMETRY,
 )
 from .display import CursesDisplay
 from .widgets import HeaderWidget, TableWidget, FooterWidget, HelpWidget, OpcodePanel, TelemetryPanelWidget
@@ -446,7 +448,7 @@ class LiveStatsCollector(Collector):
         extra_header_lines = (
             FINISHED_BANNER_EXTRA_LINES if self.finished else 0
         )
-        extra_telemetry_lines = TELEMETRY_PANEL_HEIGHT if self.show_telemetry_panel else 0
+        extra_telemetry_lines = self.telemetry_panel_height(height) if self.show_telemetry_panel else 0
         max_stats_lines = max(
             0,
             height
@@ -1179,6 +1181,21 @@ class LiveStatsCollector(Collector):
             panel = self.telemetry_panels.get(plugin_id)
         if panel is not None:
             panel.ingest(event_type, payload)
+
+    def telemetry_panel_height(self, height):
+        """Lines of the telemetry area, title included, for a terminal of ``height`` rows.
+
+        ``TELEMETRY_PANEL_HEIGHT`` or a third of the terminal, whichever is
+        more, so tall terminals show more plugin rows while the CPU table
+        keeps two thirds. On a terminal too short for that, the area shrinks
+        so the header, ``MIN_STATS_LINES_WITH_TELEMETRY`` CPU rows and the
+        footer stay on screen, down to ``TELEMETRY_PANEL_MIN_HEIGHT``.
+        """
+        wanted = max(TELEMETRY_PANEL_HEIGHT, height // 3)
+        extra_header_lines = FINISHED_BANNER_EXTRA_LINES if self.finished else 0
+        room = (height - HEADER_LINES - extra_header_lines - FOOTER_LINES
+                - SAFETY_MARGIN - MIN_STATS_LINES_WITH_TELEMETRY)
+        return max(TELEMETRY_PANEL_MIN_HEIGHT, min(wanted, room))
 
     def _get_current_telemetry_plugin(self):
         if not self.telemetry_plugin_order:

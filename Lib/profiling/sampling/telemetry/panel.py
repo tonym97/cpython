@@ -39,6 +39,11 @@ class TelemetryPanel:
     # tags the key in the footer as 'e':label. Keys the TUI itself uses need
     # no listing: they still reach the panel, after the TUI has acted on them.
     key_bindings = ()
+    # Lines the TUI will draw from render_lines: the telemetry area minus its
+    # title. The TUI sets it before every render (12-line area by default,
+    # a third of the terminal when that is more), so a panel can size its
+    # tables to it; render_lines may return more, the rest is not drawn.
+    max_lines = 11
 
     def __init__(self):
         # Trend colours follow the TUI's toggle (x), which handle_key sees.

@@ -907,8 +907,11 @@ class FooterWidget(Widget):
         if self.collector.finished:
             footer = f"{status_str}"
         else:
-            footer = f"{status_str}Sort: {sort_display} | 't':mode 'x':trends 'g':panel 'n':plugin 'm':mode"
-            # The shown plugin's own keys with their one-word labels: 'e':fold.
+            footer = f"{status_str}Sort: {sort_display} | 't':mode 'x':trends"
+            # Telemetry keys only when a plugin is loaded; the shown plugin's
+            # own keys follow with their one-word labels: 'e':collapse.
+            if self.collector.telemetry_plugin_order:
+                footer += " 'g':panel 'n':plugin 'm':mode"
             if self.collector.show_telemetry_panel:
                 _, panel = self.collector._get_current_telemetry_plugin()
                 for binding in (panel.key_bindings if panel is not None else ()):
@@ -1192,7 +1195,11 @@ class TelemetryPanelWidget(Widget):
         self.add_str(line, 0, title[: width - 1], self.colors.get("magenta", A_BOLD) | A_BOLD)
         line += 1
 
-        for panel_line in panel.render_lines(mode, width)[: TELEMETRY_PANEL_HEIGHT - 1]:
+        height = kwargs.get("height")
+        area = (self.collector.telemetry_panel_height(height) if height
+                else TELEMETRY_PANEL_HEIGHT)
+        panel.max_lines = area - 1
+        for panel_line in panel.render_lines(mode, width)[: area - 1]:
             try:
                 self._draw_line(line, width, panel_line)
             except Exception:

@@ -10,7 +10,12 @@ resolved in this order:
    ``my_plugin = my_plugin_package:PLUGIN`` in its project metadata;
 3. the dotted path of any importable module (``--plugin
    my_company.tachyon_plugin``), which provides its plugin as a
-   ``TelemetryPlugin`` subclass named ``PLUGIN``.
+   ``TelemetryPlugin`` subclass named ``PLUGIN``; the path must contain a
+   dot, so a top-level module is not taken for a plugin id.
+
+An id that matches an entry point or looks like a module path but fails to
+load is unknown; ``plugin_load_error`` keeps the exception text so the
+command line can say why.
 
 Event records carry only the ``plugin_id``, so a plugin that should work for
 ``replay`` and in the Python helper process registers an entry point; a
@@ -31,6 +36,7 @@ from .plugin import TelemetryPlugin
 
 _BUNDLED = None
 _EXTERNAL = {}
+_LOAD_ERRORS = {}  # plugin id -> text of the exception that stopped its load
 
 
 def _plugin_class_from_module(module, fallback_id):
@@ -50,7 +56,10 @@ def _discover_bundled():
             continue
         try:
             module = importlib.import_module(f"{plugins_pkg.__name__}.{module_info.name}")
-        except Exception:
+        except Exception as exc:
+            # The id is unknown until the module imports; keep the cause under
+            # the module name so `--plugin <name>` can report it.
+            _LOAD_ERRORS[module_info.name] = repr(exc)
             continue
         plugin_class = _plugin_class_from_module(module, module_info.name)
         if plugin_class is not None:
@@ -75,7 +84,9 @@ def _from_entry_point(plugin_id):
             continue
         try:
             target = entry_point.load()
-        except Exception:
+        except Exception as exc:
+            target_name = getattr(entry_point, "value", entry_point.name)
+            _LOAD_ERRORS[plugin_id] = f"entry point {target_name!r}: {exc!r}"
             return None
         if isinstance(target, type) and issubclass(target, TelemetryPlugin):
             plugin_class = target
@@ -92,7 +103,13 @@ def _from_dotted_path(plugin_id):
         return None
     try:
         module = importlib.import_module(plugin_id)
-    except ImportError:
+    except ModuleNotFoundError as exc:
+        if exc.name in (plugin_id, plugin_id.split(".")[0]):
+            return None  # no such module: an ordinary unknown id
+        _LOAD_ERRORS[plugin_id] = repr(exc)
+        return None
+    except Exception as exc:  # the module exists and raised while importing
+        _LOAD_ERRORS[plugin_id] = repr(exc)
         return None
     return _plugin_class_from_module(module, plugin_id)
 
@@ -114,6 +131,11 @@ def get_plugin_class(plugin_id):
 
 def is_known_plugin(plugin_id):
     return get_plugin_class(plugin_id) is not None
+
+
+def plugin_load_error(plugin_id):
+    """Why ``plugin_id`` failed to load (exception text), or ``None``."""
+    return _LOAD_ERRORS.get(plugin_id)
 
 
 def list_plugin_ids():
