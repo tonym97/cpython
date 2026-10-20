@@ -14,13 +14,25 @@ import webbrowser
 from contextlib import nullcontext
 
 from .errors import SamplingUnknownProcessError, SamplingModuleNotFoundError, SamplingScriptNotFoundError
-from .sample import sample, sample_live, _is_process_running
+from .sample import sample, sample_live, dump_stack, _is_process_running
+from .dump import print_stack_dump
 from .pstats_collector import PstatsCollector
 from .stack_collector import CollapsedStackCollector, FlamegraphCollector, DiffFlamegraphCollector
 from .heatmap_collector import HeatmapCollector
 from .gecko_collector import GeckoCollector
+from .jsonl_collector import JsonlCollector
 from .binary_collector import BinaryCollector
 from .binary_reader import BinaryReader
+from .telemetry.plugin_registry import (
+    get_plugin_class,
+    is_known_plugin,
+    list_plugin_ids,
+    make_plugin,
+    plugin_load_error,
+)
+from .telemetry.records import TelemetryRecordBuffer
+from .telemetry.summary import summary_lines
+from .telemetry.replay import replay_sidecar_to_sink
 from .constants import (
     MICROSECONDS_PER_SECOND,
     PROFILING_MODE_ALL,
@@ -72,6 +84,9 @@ Examples:
   # Attach to a running process
   `python -m profiling.sampling attach 1234`
 
+  # Dump a running process's current stack
+  `python -m profiling.sampling dump 1234`
+
   # Live interactive mode for a script
   `python -m profiling.sampling run --live script.py`
 
@@ -82,8 +97,8 @@ Use `python -m profiling.sampling <command> --help` for command-specific help.""
 
 
 # Constants for socket synchronization
-_SYNC_TIMEOUT_SEC = 5.0
-_PROCESS_KILL_TIMEOUT_SEC = 2.0
+_SYNC_TIMEOUT_SEC = 15.0
+_PROCESS_KILL_TIMEOUT_SEC = 5.0
 _READY_MESSAGE = b"ready"
 _RECV_BUFFER_SIZE = 1024
 _BINARY_PROFILE_HEADER_SIZE = 64
@@ -97,6 +112,7 @@ FORMAT_EXTENSIONS = {
     "diff_flamegraph": "html",
     "gecko": "json",
     "heatmap": "html",
+    "jsonl": "jsonl",
     "binary": "bin",
 }
 
@@ -107,8 +123,12 @@ COLLECTOR_MAP = {
     "diff_flamegraph": DiffFlamegraphCollector,
     "gecko": GeckoCollector,
     "heatmap": HeatmapCollector,
+    "jsonl": JsonlCollector,
     "binary": BinaryCollector,
 }
+
+BROWSER_COMPATIBLE_FORMATS = ("flamegraph", "diff_flamegraph", "heatmap")
+
 
 def _setup_child_monitor(args, parent_pid):
     # Build CLI args for child profilers (excluding --subprocesses to avoid recursion)
@@ -159,8 +179,17 @@ def _build_child_profiler_args(args):
     if mode != "wall":
         child_args.extend(["--mode", mode])
 
+    # Telemetry plugins, with the options the user gave them, so a child
+    # profiler runs each plugin the way the parent does.
+    child_plugins = getattr(args, "plugins", None) or []
+    for plugin_id in child_plugins:
+        child_args.extend(["--plugin", plugin_id])
+        child_args.extend(_plugin_option_tokens(plugin_id, args))
+
     # Format options (skip pstats as it's the default)
-    if args.format != "pstats":
+    if args.format == "diff_flamegraph":
+        child_args.extend(["--diff-flamegraph", args.diff_baseline])
+    elif args.format != "pstats":
         child_args.append(f"--{args.format}")
 
     return child_args
@@ -249,8 +278,13 @@ def _wait_for_ready_signal(sync_sock, process, timeout):
         sel.close()
 
 
-def _run_with_sync(original_cmd, suppress_output=False):
-    """Run a command with socket-based synchronization and return the process."""
+def _run_with_sync(original_cmd, suppress_output=False, env=None):
+    """Run a command with socket-based synchronization and return the process.
+
+    ``env`` holds extra environment variables for the child (merged over the
+    current environment); telemetry plugins use it to switch on target-side
+    tracing.
+    """
     # Create a TCP socket for synchronization with better socket options
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sync_sock:
         # Set SO_REUSEADDR to avoid "Address already in use" errors
@@ -279,6 +313,8 @@ def _run_with_sync(original_cmd, suppress_output=False):
         # When suppress_output=False (normal mode), let stderr inherit so
         # script errors print to the terminal.
         popen_kwargs = {}
+        if env:
+            popen_kwargs["env"] = {**os.environ, **env}
         if suppress_output:
             popen_kwargs["stdin"] = subprocess.DEVNULL
             popen_kwargs["stdout"] = subprocess.DEVNULL
@@ -385,13 +421,13 @@ def _add_sampling_options(parser):
     sampling_group.add_argument(
         "--native",
         action="store_true",
-        help='Include artificial "<native>" frames to denote calls to non-Python code',
+        help='Include artificial `<native>` frames to denote calls to non-Python code',
     )
     sampling_group.add_argument(
         "--no-gc",
         action="store_false",
         dest="gc",
-        help='Don\'t include artificial "<GC>" frames to denote active garbage collection',
+        help='Don\'t include artificial `<GC>` frames to denote active garbage collection',
     )
     sampling_group.add_argument(
         "--opcodes",
@@ -416,8 +452,71 @@ def _add_sampling_options(parser):
         "Uses thread_suspend on macOS and ptrace on Linux. Adds overhead but ensures memory "
         "reads are from a frozen state.",
     )
+    sampling_group.add_argument(
+        "--plugin",
+        dest="plugins",
+        action="append",
+        default=[],
+        help="Enable a telemetry plugin: a bundled id, an installed plugin's "
+             "entry point id, or an importable dotted module path (repeatable)",
+    )
+    _add_plugin_cli_flags(parser)
 
 
+def _plugins_named_on_command_line(argv=None):
+    """Plugin ids given with --plugin, read before parsing so their options can be registered."""
+    argv = sys.argv[1:] if argv is None else argv
+    found = []
+    for i, token in enumerate(argv):
+        if token == "--plugin" and i + 1 < len(argv):
+            found.append(argv[i + 1])
+        elif token.startswith("--plugin="):
+            found.append(token.partition("=")[2])
+    return list(dict.fromkeys(found))
+
+
+def _plugin_option_tokens(plugin_id, args):
+    """The command line tokens that reproduce ``args``' values of a plugin's options.
+
+    The plugin's ``register_cli_flags`` is replayed into a scratch parser to
+    learn its options; every option whose value in ``args`` differs from the
+    option's default is emitted as ``--flag`` (store_true/false) or
+    ``--flag value``.
+    """
+    plugin_class = get_plugin_class(plugin_id)
+    if plugin_class is None:
+        return []
+    scratch = argparse.ArgumentParser(add_help=False)
+    plugin_class.register_cli_flags(scratch)
+    tokens = []
+    for action in scratch._actions:
+        if not action.option_strings:
+            continue
+        value = getattr(args, action.dest, argparse.SUPPRESS)
+        if value is argparse.SUPPRESS or value is None or value == action.default:
+            continue
+        flag = action.option_strings[-1]
+        if isinstance(action, (argparse._StoreTrueAction, argparse._StoreFalseAction)):
+            tokens.append(flag)
+        elif isinstance(action, argparse._AppendAction):
+            for item in value:
+                tokens.extend([flag, str(item)])
+        elif action.nargs in (None, 1, "?"):
+            tokens.extend([flag, str(value)])
+        else:
+            tokens.append(flag)
+            tokens.extend(str(item) for item in value)
+    return tokens
+
+
+def _add_plugin_cli_flags(parser):
+    """Let each plugin named on the command line add its own options."""
+    for plugin_id in _plugins_named_on_command_line():
+        plugin_class = get_plugin_class(plugin_id)
+        if plugin_class is None:
+            continue  # reported by _validate_args
+        group = parser.add_argument_group(f"Telemetry plugin options ({plugin_id})")
+        plugin_class.register_cli_flags(group)
 def _add_mode_options(parser):
     """Add mode options to a parser."""
     mode_group = parser.add_argument_group("Mode options")
@@ -428,14 +527,14 @@ def _add_mode_options(parser):
         help="Sampling mode: wall (all samples), cpu (only samples when thread is on CPU), "
         "gil (only samples when thread holds the GIL), "
         "exception (only samples when thread has an active exception). "
-        "Incompatible with --async-aware",
+        "Incompatible with `--async-aware`",
     )
     mode_group.add_argument(
         "--async-mode",
         choices=["running", "all"],
         default="running",
         help='Async profiling mode: "running" (only running task) '
-        'or "all" (all tasks including waiting). Requires --async-aware',
+        'or "all" (all tasks including waiting). Requires `--async-aware`',
     )
 
 
@@ -482,7 +581,14 @@ def _add_format_options(parser, include_compression=True, include_binary=True):
         "--diff-flamegraph",
         metavar="BASELINE",
         action=DiffFlamegraphAction,
-        help="Generate differential flamegraph comparing current profile to BASELINE binary file",
+        help="Generate differential flamegraph comparing current profile to `BASELINE` binary file",
+    )
+    format_group.add_argument(
+        "--jsonl",
+        action="store_const",
+        const="jsonl",
+        dest="format",
+        help="Generate newline-delimited JSON (JSONL) for programmatic consumers",
     )
     if include_binary:
         format_group.add_argument(
@@ -490,7 +596,7 @@ def _add_format_options(parser, include_compression=True, include_binary=True):
             action="store_const",
             const="binary",
             dest="format",
-            help="Generate high-performance binary format (use 'replay' command to convert)",
+            help="Generate high-performance binary format (use `replay` command to convert)",
         )
     parser.set_defaults(format="pstats", diff_baseline=None)
 
@@ -506,14 +612,18 @@ def _add_format_options(parser, include_compression=True, include_binary=True):
         "-o",
         "--output",
         dest="outfile",
-        help="Output path (default: stdout for pstats text; with -o, pstats is binary). "
-        "Auto-generated for other formats. For heatmap: directory name (default: heatmap_PID)",
+        help="Output path (default: `stdout` for `pstats` text; with `-o`, `pstats` is binary). "
+        "Auto-generated for other formats. For heatmap: directory name (default: `heatmap_PID`)",
     )
     output_group.add_argument(
         "--browser",
         action="store_true",
-        help="Automatically open HTML output (flamegraph, heatmap) in browser. "
-        "When using --subprocesses, only the main process opens the browser",
+        help=(
+            "Automatically open HTML output "
+            f"({', '.join('--' + f.replace('_', '-') for f in BROWSER_COMPATIBLE_FORMATS)}) "
+            "in browser. "
+            "When using `--subprocesses`, only the main process opens the browser"
+        ),
     )
 
 
@@ -548,6 +658,51 @@ def _add_pstats_options(parser):
     )
 
 
+def _add_dump_options(parser):
+    """Add one-shot stack dump options to a parser."""
+    dump_group = parser.add_argument_group("Dump options")
+    dump_group.add_argument(
+        "-a",
+        "--all-threads",
+        action="store_true",
+        help="Dump all threads in the process instead of just the main thread",
+    )
+    dump_group.add_argument(
+        "--native",
+        action="store_true",
+        help='Include artificial `<native>` frames to denote calls to non-Python code',
+    )
+    dump_group.add_argument(
+        "--no-gc",
+        action="store_false",
+        dest="gc",
+        help='Don\'t include artificial `<GC>` frames to denote active garbage collection',
+    )
+    dump_group.add_argument(
+        "--opcodes",
+        action="store_true",
+        help="Show bytecode opcode names when available.",
+    )
+    dump_group.add_argument(
+        "--async-aware",
+        action="store_true",
+        help="Enable async-aware stack reconstruction",
+    )
+    dump_group.add_argument(
+        "--async-mode",
+        choices=["running", "all"],
+        default=argparse.SUPPRESS,
+        help='Async stack mode: "running" (only running task) '
+        'or "all" (all tasks including waiting, default for dump). '
+        "Requires `--async-aware`",
+    )
+    dump_group.add_argument(
+        "--blocking",
+        action="store_true",
+        help="Stop all threads in target process before dumping the stack.",
+    )
+
+
 def _sort_to_mode(sort_choice):
     """Convert sort choice string to SORT_MODE constant."""
     sort_map = {
@@ -561,19 +716,34 @@ def _sort_to_mode(sort_choice):
     }
     return sort_map.get(sort_choice, SORT_MODE_NSAMPLES)
 
+
+def _capture_config_from_args(args):
+    return {
+        "all_threads": args.all_threads,
+        "native": args.native,
+        "gc": args.gc,
+        "opcodes": args.opcodes,
+        "blocking": args.blocking,
+    }
+
+
 def _create_collector(format_type, sample_interval_usec, skip_idle, opcodes=False,
-                      output_file=None, compression='auto', diff_baseline=None):
+                      mode=None, output_file=None, compression='auto',
+                      diff_baseline=None, capture_config=None):
     """Create the appropriate collector based on format type.
 
     Args:
-        format_type: The output format ('pstats', 'collapsed', 'flamegraph', 'gecko', 'heatmap', 'binary', 'diff_flamegraph')
+        format_type: The output format ('pstats', 'collapsed', 'flamegraph',
+                    'gecko', 'heatmap', 'jsonl', 'binary', 'diff_flamegraph')
         sample_interval_usec: Sampling interval in microseconds
         skip_idle: Whether to skip idle samples
         opcodes: Whether to collect opcode information (only used by gecko format
                  for creating interval markers in Firefox Profiler)
+        mode: Profiling mode for collectors that expose it in metadata
         output_file: Output file path (required for binary format)
         compression: Compression type for binary format ('auto', 'zstd', 'none')
         diff_baseline: Path to baseline binary file for differential flamegraph
+        capture_config: Capture feature mapping for binary profiles and diffs
 
     Returns:
         A collector instance of the appropriate type
@@ -590,7 +760,9 @@ def _create_collector(format_type, sample_interval_usec, skip_idle, opcodes=Fals
         return collector_class(
             sample_interval_usec,
             baseline_binary_path=diff_baseline,
-            skip_idle=skip_idle
+            skip_idle=skip_idle,
+            mode=mode,
+            capture_config=capture_config,
         )
 
     # Binary format requires output file and compression
@@ -598,13 +770,19 @@ def _create_collector(format_type, sample_interval_usec, skip_idle, opcodes=Fals
         if output_file is None:
             raise ValueError("Binary format requires an output file")
         return collector_class(output_file, sample_interval_usec, skip_idle=skip_idle,
-                              compression=compression)
+                              compression=compression, mode=mode,
+                              capture_config=capture_config)
 
     # Gecko format never skips idle (it needs both GIL and CPU data)
     # and is the only format that uses opcodes for interval markers
     if format_type == "gecko":
         skip_idle = False
         return collector_class(sample_interval_usec, skip_idle=skip_idle, opcodes=opcodes)
+
+    if format_type == "jsonl":
+        return collector_class(
+            sample_interval_usec, skip_idle=skip_idle, mode=mode
+        )
 
     return collector_class(sample_interval_usec, skip_idle=skip_idle)
 
@@ -684,7 +862,9 @@ def _replay_with_reader(args, reader):
 
     collector = _create_collector(
         args.format, interval, skip_idle=False,
-        diff_baseline=args.diff_baseline
+        mode=info.get("mode"),
+        diff_baseline=args.diff_baseline,
+        capture_config=info.get("capture_config"),
     )
 
     def progress_callback(current, total):
@@ -700,6 +880,11 @@ def _replay_with_reader(args, reader):
             )
 
     count = reader.replay_samples(collector, progress_callback)
+    replayed_collector = collector
+    if hasattr(collector, "set_replay_stats"):
+        collector.set_replay_stats(info)
+    if hasattr(collector, "set_mode"):
+        collector.set_mode(info.get("mode"))
     print()
 
     if args.format == "pstats":
@@ -713,25 +898,26 @@ def _replay_with_reader(args, reader):
             sort_mode = _sort_to_mode(sort_choice)
             collector.print_stats(
                 sort_mode, limit, not args.no_summary,
-                PROFILING_MODE_WALL
+                info.get("mode") if info.get("mode") is not None
+                else PROFILING_MODE_WALL
             )
     else:
         filename = (
             args.outfile
             or _generate_output_filename(args.format, os.getpid())
         )
-        collector.export(filename)
+        export_ok = collector.export(filename)
 
         # Auto-open browser for HTML output if --browser flag is set
         if (
-            args.format in (
-                'flamegraph', 'diff_flamegraph', 'heatmap'
-            )
+            export_ok
+            and args.format in BROWSER_COMPATIBLE_FORMATS
             and getattr(args, 'browser', False)
         ):
             _open_in_browser(filename)
 
     print(f"Replayed {count} samples")
+    _print_sidecar_summary(args.input_file, replayed_collector)
 
 
 def _handle_output(collector, args, pid, mode):
@@ -771,10 +957,14 @@ def _handle_output(collector, args, pid, mode):
             filename = os.path.join(args.outfile, _generate_output_filename(args.format, pid))
         else:
             filename = args.outfile or _generate_output_filename(args.format, pid)
-        collector.export(filename)
+        export_ok = collector.export(filename)
 
         # Auto-open browser for HTML output if --browser flag is set
-        if args.format in ('flamegraph', 'diff_flamegraph', 'heatmap') and getattr(args, 'browser', False):
+        if (
+            export_ok
+            and args.format in BROWSER_COMPATIBLE_FORMATS
+            and getattr(args, 'browser', False)
+        ):
             _open_in_browser(filename)
 
 
@@ -785,18 +975,22 @@ def _validate_args(args, parser):
         args: Parsed command-line arguments
         parser: ArgumentParser instance for error reporting
     """
-    # Replay command has no special validation needed
-    if getattr(args, 'command', None) == "replay":
+    command = getattr(args, 'command', None)
+
+    if command == "replay":
         return
 
-    # Warn about blocking mode with aggressive sampling intervals
-    if args.blocking and args.sample_interval_usec < 100:
-        print(
-            f"Warning: --blocking with a {args.sample_interval_usec} µs interval will stop all threads "
-            f"{1_000_000 // args.sample_interval_usec} times per second. "
-            "Consider using --sampling-rate 1khz or lower to reduce overhead.",
-            file=sys.stderr
-        )
+    # Deduplicate telemetry plugins while preserving order, and reject unknown ones early
+    if getattr(args, "plugins", None):
+        args.plugins = list(dict.fromkeys(args.plugins))
+        for plugin_id in args.plugins:
+            if not is_known_plugin(plugin_id):
+                known = ", ".join(list_plugin_ids()) or "none"
+                cause = plugin_load_error(plugin_id)
+                detail = (f"it failed to load: {cause}" if cause
+                          else "or give an importable dotted module path")
+                parser.error(
+                    f"Unknown telemetry plugin {plugin_id!r} (known plugins: {known}; {detail})")
 
     # Check if live mode is available
     if hasattr(args, 'live') and args.live and LiveStatsCollector is None:
@@ -814,13 +1008,15 @@ def _validate_args(args, parser):
         if hasattr(args, 'live') and args.live:
             parser.error("--subprocesses is incompatible with --live mode.")
 
-    # Async-aware mode is incompatible with --native, --no-gc, --mode, and --all-threads
+    # Async-aware mode is incompatible with options that need thread data.
     if getattr(args, 'async_aware', False):
         issues = []
-        if args.native:
+        if getattr(args, 'native', False):
             issues.append("--native")
-        if not args.gc:
+        if not getattr(args, 'gc', True):
             issues.append("--no-gc")
+        if getattr(args, 'format', None) == "binary":
+            issues.append("--binary")
         if hasattr(args, 'mode') and args.mode != "wall":
             issues.append(f"--mode={args.mode}")
         if hasattr(args, 'all_threads') and args.all_threads:
@@ -831,9 +1027,26 @@ def _validate_args(args, parser):
                 "Async-aware profiling uses task-based stack reconstruction."
             )
 
-    # --async-mode requires --async-aware
-    if hasattr(args, 'async_mode') and args.async_mode != "running" and not getattr(args, 'async_aware', False):
-        parser.error("--async-mode requires --async-aware to be enabled.")
+    # --async-mode requires --async-aware when explicitly set
+    if not getattr(args, 'async_aware', False):
+        if command == "dump":
+            # dump uses SUPPRESS default, so attr only exists if user passed it
+            if hasattr(args, 'async_mode'):
+                parser.error("--async-mode requires --async-aware to be enabled.")
+        elif hasattr(args, 'async_mode') and args.async_mode != "running":
+            parser.error("--async-mode requires --async-aware to be enabled.")
+
+    if command == "dump":
+        return
+
+    # Warn about blocking mode with aggressive sampling intervals
+    if args.blocking and args.sample_interval_usec < 100:
+        print(
+            f"Warning: --blocking with a {args.sample_interval_usec} µs interval will stop all threads "
+            f"{1_000_000 // args.sample_interval_usec} times per second. "
+            "Consider using --sampling-rate 1khz or lower to reduce overhead.",
+            file=sys.stderr
+        )
 
     # Live mode is incompatible with format options
     if hasattr(args, 'live') and args.live:
@@ -940,7 +1153,7 @@ Examples:
         "-m",
         "--module",
         action="store_true",
-        help="Run target as a module (like python -m)",
+        help="Run target as a module (like `python -m`)",
     )
     run_parser.add_argument(
         "target",
@@ -990,6 +1203,27 @@ Examples:
     _add_format_options(attach_parser)
     _add_pstats_options(attach_parser)
 
+    # === DUMP COMMAND ===
+    dump_parser = subparsers.add_parser(
+        "dump",
+        help="Dump a running process's current stack",
+        formatter_class=CustomFormatter,
+        description="""Dump a running process's current Python stack
+
+Examples:
+  # Dump the main thread stack
+  `python -m profiling.sampling dump 1234`
+
+  # Dump all thread stacks
+  `python -m profiling.sampling dump -a 1234`""",
+    )
+    dump_parser.add_argument(
+        "pid",
+        type=int,
+        help="Process ID to dump",
+    )
+    _add_dump_options(dump_parser)
+
     # === REPLAY COMMAND ===
     replay_parser = subparsers.add_parser(
         "replay",
@@ -1024,6 +1258,7 @@ Examples:
     command_handlers = {
         "run": _handle_run,
         "attach": _handle_attach,
+        "dump": _handle_dump,
         "replay": _handle_replay,
     }
 
@@ -1062,11 +1297,13 @@ def _handle_attach(args):
 
     # Create the appropriate collector
     collector = _create_collector(
-        args.format, args.sample_interval_usec, skip_idle, args.opcodes,
+        args.format, args.sample_interval_usec, skip_idle, args.opcodes, mode,
         output_file=output_file,
         compression=getattr(args, 'compression', 'auto'),
-        diff_baseline=args.diff_baseline
+        diff_baseline=args.diff_baseline,
+        capture_config=_capture_config_from_args(args),
     )
+    telemetry_plugins = _build_telemetry_plugins(args)
 
     with _get_child_monitor_context(args, args.pid):
         collector = sample(
@@ -1081,8 +1318,38 @@ def _handle_attach(args):
             gc=args.gc,
             opcodes=args.opcodes,
             blocking=args.blocking,
+            telemetry_plugins=telemetry_plugins,
         )
         _handle_output(collector, args, args.pid, mode)
+        _print_telemetry_summary(collector)
+
+
+def _handle_dump(args):
+    if not _is_process_running(args.pid):
+        raise SamplingUnknownProcessError(args.pid)
+
+    # Async-aware reconstruction requires wall mode so every thread is sampled,
+    # not just those holding the GIL or on CPU.
+    mode = PROFILING_MODE_WALL if args.async_aware else PROFILING_MODE_ALL
+    async_mode = getattr(args, "async_mode", "all") if args.async_aware else None
+    try:
+        stack_frames = dump_stack(
+            args.pid,
+            all_threads=args.all_threads,
+            mode=mode,
+            async_aware=async_mode,
+            native=args.native,
+            gc=args.gc,
+            opcodes=args.opcodes,
+            blocking=args.blocking,
+        )
+    except ProcessLookupError:
+        sys.exit(
+            f"No stack dump collected - process {args.pid} exited before "
+            "its stack could be read."
+        )
+
+    print_stack_dump(stack_frames, pid=args.pid)
 
 
 def _handle_run(args):
@@ -1119,7 +1386,7 @@ def _handle_run(args):
 
     # Run with synchronization
     try:
-        process = _run_with_sync(cmd, suppress_output=False)
+        process = _run_with_sync(cmd, suppress_output=False, **_telemetry_popen_overrides(args))
     except RuntimeError as e:
         sys.exit(f"Error: {e}")
 
@@ -1141,11 +1408,13 @@ def _handle_run(args):
 
     # Create the appropriate collector
     collector = _create_collector(
-        args.format, args.sample_interval_usec, skip_idle, args.opcodes,
+        args.format, args.sample_interval_usec, skip_idle, args.opcodes, mode,
         output_file=output_file,
         compression=getattr(args, 'compression', 'auto'),
-        diff_baseline=args.diff_baseline
+        diff_baseline=args.diff_baseline,
+        capture_config=_capture_config_from_args(args),
     )
+    telemetry_plugins = _build_telemetry_plugins(args)
 
     with _get_child_monitor_context(args, process.pid):
         try:
@@ -1161,8 +1430,10 @@ def _handle_run(args):
                 gc=args.gc,
                 opcodes=args.opcodes,
                 blocking=args.blocking,
+                telemetry_plugins=telemetry_plugins,
             )
             _handle_output(collector, args, process.pid, mode)
+            _print_telemetry_summary(collector)
         finally:
             # Terminate the main subprocess - child profilers finish when their
             # target processes exit
@@ -1183,6 +1454,7 @@ def _handle_live_attach(args, pid):
     skip_idle = mode != PROFILING_MODE_WALL
 
     # Create live collector with default settings
+    telemetry_plugins = _build_telemetry_plugins(args)
     collector = LiveStatsCollector(
         args.sample_interval_usec,
         skip_idle=skip_idle,
@@ -1192,6 +1464,7 @@ def _handle_live_attach(args, pid):
         mode=mode,
         opcodes=args.opcodes,
         async_aware=args.async_mode if args.async_aware else None,
+        telemetry_plugins=telemetry_plugins,
     )
 
     # Sample in live mode
@@ -1207,6 +1480,7 @@ def _handle_live_attach(args, pid):
         gc=args.gc,
         opcodes=args.opcodes,
         blocking=args.blocking,
+        telemetry_plugins=telemetry_plugins,
     )
 
 
@@ -1220,7 +1494,7 @@ def _handle_live_run(args):
 
     # Run with synchronization, suppressing output for live mode
     try:
-        process = _run_with_sync(cmd, suppress_output=True)
+        process = _run_with_sync(cmd, suppress_output=True, **_telemetry_popen_overrides(args))
     except RuntimeError as e:
         sys.exit(f"Error: {e}")
 
@@ -1230,6 +1504,7 @@ def _handle_live_run(args):
     skip_idle = mode != PROFILING_MODE_WALL
 
     # Create live collector with default settings
+    telemetry_plugins = _build_telemetry_plugins(args)
     collector = LiveStatsCollector(
         args.sample_interval_usec,
         skip_idle=skip_idle,
@@ -1239,6 +1514,7 @@ def _handle_live_run(args):
         mode=mode,
         opcodes=args.opcodes,
         async_aware=args.async_mode if args.async_aware else None,
+        telemetry_plugins=telemetry_plugins,
     )
 
     # Profile the subprocess in live mode
@@ -1255,6 +1531,7 @@ def _handle_live_run(args):
             gc=args.gc,
             opcodes=args.opcodes,
             blocking=args.blocking,
+            telemetry_plugins=telemetry_plugins,
         )
     finally:
         # Clean up the subprocess and get any error output
@@ -1292,6 +1569,55 @@ def _handle_replay(args):
             _replay_with_reader(args, reader)
     except (OSError, ValueError) as exc:
         sys.exit(f"Error: {exc}")
+
+
+def _build_telemetry_plugins(args):
+    """Instantiate the plugins named with --plugin, with their options applied.
+
+    The same instances feed the live collector (panels) and the sampler
+    (helper processes), so both see one configuration.
+    """
+    plugins = []
+    for plugin_id in getattr(args, "plugins", None) or ():
+        plugin_class = get_plugin_class(plugin_id)
+        if plugin_class is not None:
+            plugins.append(make_plugin(plugin_id, plugin_class.extract_cli_config(args)))
+    return plugins or None
+
+
+def _print_telemetry_lines(buffer):
+    lines = summary_lines(buffer)
+    if lines:
+        print()
+        print("\n".join(lines))
+
+
+def _print_telemetry_summary(collector):
+    """Print buffered plugin events for collectors without a live panel or sidecar."""
+    _print_telemetry_lines(collector.telemetry_records)
+
+
+def _print_sidecar_summary(binary_filename, collector):
+    """After replaying into a collector that ignores plugin events, summarise the sidecar."""
+    if getattr(collector, "accepts_plugin_events", False):
+        return
+    buffer = TelemetryRecordBuffer()
+    replay_sidecar_to_sink(binary_filename, buffer)
+    _print_telemetry_lines(buffer)
+
+
+def _telemetry_target_environment(args):
+    """Environment variables telemetry plugins want on a target started by ``run``."""
+    env = {}
+    for plugin in _build_telemetry_plugins(args) or []:
+        env.update(plugin.target_environment())
+    return env
+
+
+def _telemetry_popen_overrides(args):
+    """Keyword overrides for ``_run_with_sync``; empty when no plugin needs any."""
+    env = _telemetry_target_environment(args)
+    return {"env": env} if env else {}
 
 
 if __name__ == "__main__":

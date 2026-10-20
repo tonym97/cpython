@@ -4,7 +4,10 @@ import _remote_debugging
 
 from .gecko_collector import GeckoCollector
 from .stack_collector import FlamegraphCollector, CollapsedStackCollector
+from .jsonl_collector import JsonlCollector
 from .pstats_collector import PstatsCollector
+from .binary_collector import CAPTURE_FEATURES
+from .telemetry import replay_sidecar_to_sink
 
 
 class BinaryReader:
@@ -49,10 +52,21 @@ class BinaryReader:
                 - string_count: Number of unique strings
                 - frame_count: Number of unique frames
                 - compression: Compression type used
+                - mode: Profiling mode, or None if not recorded
+                - capture_config: Capture feature mapping, or None if not
+                  recorded
         """
         if self._reader is None:
             raise RuntimeError("Reader not open. Use as context manager.")
-        return self._reader.get_info()
+        info = self._reader.get_info()
+        capture_features = info.pop("capture_features")
+        info["capture_config"] = (
+            None if capture_features is None else {
+                name: bool(capture_features & bit)
+                for name, bit in CAPTURE_FEATURES.items()
+            }
+        )
+        return info
 
     def replay_samples(self, collector, progress_callback=None):
         """Replay samples from binary file through a collector.
@@ -70,7 +84,9 @@ class BinaryReader:
         """
         if self._reader is None:
             raise RuntimeError("Reader not open. Use as context manager.")
-        return self._reader.replay(collector, progress_callback)
+        replayed = self._reader.replay(collector, progress_callback)
+        replay_sidecar_to_sink(self.filename, collector)
+        return replayed
 
     @property
     def sample_count(self):
@@ -117,11 +133,17 @@ def convert_binary_to_format(input_file, output_file, output_format,
             collector = PstatsCollector(interval)
         elif output_format == 'gecko':
             collector = GeckoCollector(interval)
+        elif output_format == "jsonl":
+            collector = JsonlCollector(interval, mode=info.get("mode"))
         else:
             raise ValueError(f"Unknown output format: {output_format}")
 
         # Replay samples through collector
         count = reader.replay_samples(collector, progress_callback)
+        if hasattr(collector, "set_replay_stats"):
+            collector.set_replay_stats(info)
+        if hasattr(collector, "set_mode"):
+            collector.set_mode(info.get("mode"))
 
         # Export to target format
         collector.export(output_file)

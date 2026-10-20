@@ -1,7 +1,6 @@
 """Widget classes for the live profiling collector UI."""
 
 import curses
-import time
 from abc import ABC, abstractmethod
 
 from .constants import (
@@ -13,24 +12,15 @@ from .constants import (
     WIDTH_THRESHOLD_CUMUL_PCT,
     WIDTH_THRESHOLD_CUMTIME,
     MICROSECONDS_PER_SECOND,
-    DISPLAY_UPDATE_INTERVAL_SEC,
     MIN_BAR_WIDTH,
     MAX_SAMPLE_RATE_BAR_WIDTH,
     MAX_EFFICIENCY_BAR_WIDTH,
     MIN_SAMPLE_RATE_FOR_SCALING,
     FOOTER_LINES,
-    FINISHED_BANNER_EXTRA_LINES,
     OPCODE_PANEL_HEIGHT,
+    TELEMETRY_PANEL_HEIGHT,
 )
-from ..constants import (
-    THREAD_STATUS_HAS_GIL,
-    THREAD_STATUS_ON_CPU,
-    THREAD_STATUS_UNKNOWN,
-    THREAD_STATUS_GIL_REQUESTED,
-    PROFILING_MODE_CPU,
-    PROFILING_MODE_GIL,
-    PROFILING_MODE_WALL,
-)
+from ..constants import PROFILING_MODE_GIL
 from ..opcode_utils import get_opcode_info, format_opcode
 
 
@@ -917,7 +907,18 @@ class FooterWidget(Widget):
         if self.collector.finished:
             footer = f"{status_str}"
         else:
-            footer = f"{status_str}Sort: {sort_display} | 't':mode 'x':trends ←→:thread 'h':help 'q':quit"
+            footer = f"{status_str}Sort: {sort_display} | 't':mode 'x':trends"
+            # Telemetry keys only when a plugin is loaded; the shown plugin's
+            # own keys follow with their one-word labels: 'e':collapse.
+            if self.collector.telemetry_plugin_order:
+                footer += " 'g':panel 'n':plugin 'm':mode"
+            if self.collector.show_telemetry_panel:
+                _, panel = self.collector._get_current_telemetry_plugin()
+                for binding in (panel.key_bindings if panel is not None else ()):
+                    key, description = binding[0], binding[1]
+                    label = binding[2] if len(binding) > 2 else description.split()[0]
+                    footer += f" '{key}':{label}"
+            footer += " ←→:thread 'h':help 'q':quit"
         self.add_str(
             line,
             0,
@@ -966,6 +967,22 @@ class HelpWidget(Widget):
             ("  S           - Cycle through sort modes (backward)", A_NORMAL),
             ("  t           - Toggle view mode (ALL / per-thread)", A_NORMAL),
             ("  x           - Toggle trend colors (on/off)", A_NORMAL),
+            ("  g           - Toggle telemetry panel", A_NORMAL),
+            ("  n           - Cycle telemetry plugin", A_NORMAL),
+            ("  m           - Cycle telemetry plugin mode", A_NORMAL),
+        ]
+        # The current plugin's own keys sit next to the telemetry keys they
+        # extend, under the plugin's name, so they are found where g/n/m are.
+        telemetry_keys = kwargs.get("telemetry_keys") or []
+        if telemetry_keys:
+            plugin_id = kwargs.get("telemetry_plugin")
+            title = f"Telemetry plugin keys ({plugin_id}):" if plugin_id else "Telemetry plugin keys:"
+            help_lines += [("", A_NORMAL), (title, A_BOLD)]
+            for key, description, *_ in telemetry_keys:
+                help_lines.append((f"  {key:<11} - {description}", A_NORMAL))
+            help_lines.append(("", A_NORMAL))
+            help_lines.append(("Navigation (continued):", A_BOLD))
+        help_lines += [
             ("  j/k or ↑/↓  - Select next/previous function (--opcodes)", A_NORMAL),
             ("  ← / →       - Cycle through threads", A_NORMAL),
             ("  +           - Faster display refresh rate", A_NORMAL),
@@ -980,6 +997,8 @@ class HelpWidget(Widget):
             ("  c           - Clear filter", A_NORMAL),
             ("  ESC         - Cancel filter input", A_NORMAL),
             ("", A_NORMAL),
+        ]
+        help_lines += [
             ("Other:", A_BOLD),
             ("  h or ?      - Show/hide this help", A_NORMAL),
             ("  q           - Quit profiler", A_NORMAL),
@@ -987,7 +1006,7 @@ class HelpWidget(Widget):
             ("Press any key to close this help screen", A_BOLD),
         ]
 
-        start_line = (height - len(help_lines)) // 2
+        start_line = max(0, (height - len(help_lines)) // 2)
         for i, (text, attr) in enumerate(help_lines):
             if start_line + i < height - 1:
                 col = 2  # Left-align with small margin
@@ -1085,6 +1104,106 @@ class OpcodePanel(Widget):
         if len(sorted_opcodes) > max_rows:
             remaining = len(sorted_opcodes) - max_rows
             self.add_str(line, 2, f"... and {remaining} more opcodes", A_NORMAL)
+            line += 1
+
+        return line
+
+
+class TelemetryPanelWidget(Widget):
+    """Widget for displaying the current telemetry plugin panel.
+
+    A panel's ``render_lines`` returns one entry per line: either a plain
+    string, or a list of ``Segment`` (``(text, style)``). Style names map onto
+    the TUI's colour scheme so plugin panels look like the CPU table:
+
+    ``header``     column header (reverse video, like the CPU table header)
+    ``sorted``     the header cell of the sort column
+    ``bold``, ``dim``, ``normal``
+    ``good``, ``warn``, ``hot``   green / yellow / red, for values to watch
+    ``cyan``, ``magenta``
+    ``func``, ``file``            the CPU table's function and file:line colours
+    ``samples``                   the CPU table's sample-count colour
+    ``trend_up``, ``trend_down``  the CPU table's trend colours
+
+    The panel follows the TUI's trend toggle (``x``) itself, through
+    ``handle_key``, so it colours changing values the same way the CPU table
+    does.
+    """
+
+    def __init__(self, display, colors, collector):
+        super().__init__(display, colors)
+        self.collector = collector
+
+    def _style_attr(self, style):
+        A_BOLD = self.display.get_attr("A_BOLD")
+        A_DIM = self.display.get_attr("A_DIM")
+        A_NORMAL = self.display.get_attr("A_NORMAL")
+        colors = self.colors
+        table = {
+            "header": colors.get("normal_header", A_BOLD),
+            "sorted": colors.get("sorted_header", A_BOLD),
+            "bold": A_BOLD,
+            "dim": A_DIM,
+            "normal": A_NORMAL,
+            "good": colors.get("green", A_BOLD),
+            "warn": colors.get("yellow", A_BOLD),
+            "hot": colors.get("red", A_BOLD),
+            "cyan": colors.get("cyan", A_BOLD),
+            "magenta": colors.get("magenta", A_BOLD),
+            "func": colors.get("color_func", A_NORMAL),
+            "file": colors.get("color_file", A_NORMAL),
+            "samples": colors.get("color_samples", A_NORMAL),
+            "trend_up": colors.get("trend_up", A_BOLD),
+            "trend_down": colors.get("trend_down", A_BOLD),
+        }
+        return table.get(style, A_NORMAL)
+
+    def _draw_line(self, line, width, panel_line):
+        A_BOLD = self.display.get_attr("A_BOLD")
+        A_DIM = self.display.get_attr("A_DIM")
+        A_NORMAL = self.display.get_attr("A_NORMAL")
+        if isinstance(panel_line, str):
+            attr = A_DIM if not panel_line else (A_BOLD if panel_line.endswith(":") else A_NORMAL)
+            self.add_str(line, 0, panel_line[: width - 1], attr)
+            return
+        col = 0
+        is_header = any(style in ("header", "sorted") for _, style in panel_line)
+        for text, style in panel_line:
+            text = str(text)
+            if col >= width - 1:
+                break
+            text = text[: width - 1 - col]
+            self.add_str(line, col, text, self._style_attr(style))
+            col += len(text)
+        if is_header and col < width - 1:
+            # Extend the header background across the panel like the CPU table.
+            self.add_str(line, col, " " * (width - 1 - col), self._style_attr("header"))
+
+    def render(self, line, width, **kwargs):
+        A_BOLD = self.display.get_attr("A_BOLD")
+        A_DIM = self.display.get_attr("A_DIM")
+        plugin_id, panel = self.collector._get_current_telemetry_plugin()
+        if panel is None:
+            self.add_str(line, 0, "No telemetry plugins active.", A_DIM)
+            return line + 1
+
+        modes = list(panel.panel_modes) or ["default"]
+        mode_idx = self.collector.current_telemetry_mode_idx % len(modes)
+        mode = modes[mode_idx]
+        title = f"─── Telemetry [{plugin_id}] ({mode.upper()}) "
+        title += "─" * max(0, width - len(title) - 1)
+        self.add_str(line, 0, title[: width - 1], self.colors.get("magenta", A_BOLD) | A_BOLD)
+        line += 1
+
+        height = kwargs.get("height")
+        area = (self.collector.telemetry_panel_height(height) if height
+                else TELEMETRY_PANEL_HEIGHT)
+        panel.max_lines = area - 1
+        for panel_line in panel.render_lines(mode, width)[: area - 1]:
+            try:
+                self._draw_line(line, width, panel_line)
+            except Exception:
+                self.add_str(line, 0, str(panel_line)[: width - 1], A_DIM)
             line += 1
 
         return line

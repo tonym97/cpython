@@ -9,7 +9,7 @@ import site
 import sys
 import sysconfig
 import time
-import _colorize
+lazy import _colorize
 
 from ..collector import Collector, extract_lineno
 from ..constants import (
@@ -18,9 +18,6 @@ from ..constants import (
     THREAD_STATUS_UNKNOWN,
     THREAD_STATUS_GIL_REQUESTED,
     THREAD_STATUS_HAS_EXCEPTION,
-    PROFILING_MODE_CPU,
-    PROFILING_MODE_GIL,
-    PROFILING_MODE_WALL,
 )
 from .constants import (
     MICROSECONDS_PER_SECOND,
@@ -43,10 +40,14 @@ from .constants import (
     COLOR_PAIR_MAGENTA,
     COLOR_PAIR_RED,
     COLOR_PAIR_SORTED_HEADER,
+    TELEMETRY_PANEL_HEIGHT,
+    TELEMETRY_PANEL_MIN_HEIGHT,
+    MIN_STATS_LINES_WITH_TELEMETRY,
 )
 from .display import CursesDisplay
-from .widgets import HeaderWidget, TableWidget, FooterWidget, HelpWidget, OpcodePanel
+from .widgets import HeaderWidget, TableWidget, FooterWidget, HelpWidget, OpcodePanel, TelemetryPanelWidget
 from .trend_tracker import TrendTracker
+from ..telemetry.plugin_registry import make_plugin
 
 
 @dataclass
@@ -118,6 +119,7 @@ class LiveStatsCollector(Collector):
         mode=None,
         opcodes=False,
         async_aware=None,
+        telemetry_plugins=None,
     ):
         """
         Initialize the live stats collector.
@@ -176,6 +178,14 @@ class LiveStatsCollector(Collector):
         # Opcode statistics: {location: {opcode: count}}
         self.opcode_stats = collections.defaultdict(lambda: collections.defaultdict(int))
         self.show_opcodes = opcodes  # Show opcode panel when --opcodes flag is passed
+        # Telemetry plugins (TelemetryPlugin instances) and their live panels.
+        self.show_telemetry_panel = bool(telemetry_plugins)
+        self.telemetry_panels = {}  # plugin_id -> TelemetryPanel
+        self.telemetry_plugin_order = []
+        self.current_telemetry_plugin_idx = 0
+        self.current_telemetry_mode_idx = 0
+        for plugin in telemetry_plugins or ():
+            self._add_panel(plugin.plugin_id, plugin.create_panel())
         self.selected_row = 0  # Currently selected row in table for opcode view
         self.scroll_offset = 0  # Scroll offset for table when in opcode mode
 
@@ -206,6 +216,7 @@ class LiveStatsCollector(Collector):
         self.footer_widget = None
         self.help_widget = None
         self.opcode_panel = None
+        self.telemetry_panel = None
 
         # Color mode
         self._can_colorize = _colorize.can_colorize()
@@ -398,6 +409,12 @@ class LiveStatsCollector(Collector):
                 thread_data = self._get_or_create_thread_data(thread_id)
                 thread_data.sample_count += 1
 
+        if self.telemetry_panels:
+            # timestamp_us is the sampler's perf_counter time at unwind start.
+            now_ns = timestamp_us * 1000 if timestamp_us is not None else time.perf_counter_ns()
+            for panel in self.telemetry_panels.values():
+                panel.observe_sample(stack_frames, now_ns)
+
         if has_gc_frame:
             self.gc_frame_samples += 1
 
@@ -431,12 +448,14 @@ class LiveStatsCollector(Collector):
         extra_header_lines = (
             FINISHED_BANNER_EXTRA_LINES if self.finished else 0
         )
+        extra_telemetry_lines = self.telemetry_panel_height(height) if self.show_telemetry_panel else 0
         max_stats_lines = max(
             0,
             height
             - HEADER_LINES
             - extra_header_lines
             - FOOTER_LINES
+            - extra_telemetry_lines
             - SAFETY_MARGIN,
         )
         stats_list = stats_list[:max_stats_lines]
@@ -455,6 +474,7 @@ class LiveStatsCollector(Collector):
             self.footer_widget = FooterWidget(self.display, colors, self)
             self.help_widget = HelpWidget(self.display, colors)
             self.opcode_panel = OpcodePanel(self.display, colors, self)
+            self.telemetry_panel = TelemetryPanelWidget(self.display, colors, self)
 
     def _render_display_sections(
         self, height, width, elapsed, stats_list, colors
@@ -480,6 +500,10 @@ class LiveStatsCollector(Collector):
                 line = self.opcode_panel.render(
                     line, width, height=height, stats_list=stats_list
                 )
+            if self.show_telemetry_panel:
+                line = self.telemetry_panel.render(
+                    line, width, height=height
+                )
 
         except curses.error:
             pass
@@ -503,7 +527,10 @@ class LiveStatsCollector(Collector):
 
             # Show help screen if requested
             if self.show_help:
-                self.help_widget.render(0, width, height=height)
+                plugin_id, panel = self._get_current_telemetry_plugin()
+                self.help_widget.render(
+                    0, width, height=height, telemetry_plugin=plugin_id,
+                    telemetry_keys=list(panel.key_bindings) if panel is not None else [])
                 self.display.refresh()
                 return
 
@@ -705,6 +732,7 @@ class LiveStatsCollector(Collector):
     def reset_stats(self):
         """Reset all collected statistics."""
         self.result.clear()
+        self.opcode_stats.clear()
         self.per_thread_data.clear()
         self.thread_ids.clear()
         self.view_mode = "ALL"
@@ -1003,6 +1031,12 @@ class LiveStatsCollector(Collector):
             # Toggle trend colors on/off
             if self._trend_tracker is not None:
                 self._trend_tracker.toggle()
+        elif ch == ord("g") or ch == ord("G"):
+            self.show_telemetry_panel = not self.show_telemetry_panel
+        elif ch == ord("m") or ch == ord("M"):
+            self._cycle_telemetry_mode()
+        elif ch == ord("n") or ch == ord("N"):
+            self._cycle_telemetry_plugin()
 
         elif ch == ord("j") or ch == ord("J"):
             # Move selection down in opcode mode (with scrolling)
@@ -1036,8 +1070,23 @@ class LiveStatsCollector(Collector):
             # Navigate to next thread
             self._navigate_to_next_thread()
 
+        if ch != -1:
+            self._dispatch_key_to_telemetry(ch)
+
         # Update display if input was processed while finished
         self._handle_finished_input_update(ch != -1)
+
+    def _dispatch_key_to_telemetry(self, ch):
+        """Hand the key to every telemetry panel, shown or not.
+
+        Every panel sees every key so each tracks state (trend toggle, reset)
+        even while hidden or not the current plugin. The TUI has already
+        acted on the key, so a panel can only add behaviour, never override
+        the TUI's keys.
+        """
+        key = chr(ch) if 32 <= ch < 127 else None
+        for panel in self.telemetry_panels.values():
+            panel.handle_key(key)
 
     def init_curses(self, stdscr):
         """Initialize curses display and suppress stdout/stderr."""
@@ -1109,3 +1158,62 @@ class LiveStatsCollector(Collector):
             "Export to file is not supported in live mode. "
             "Use the live TUI to view statistics in real-time."
         )
+
+    # ---- telemetry plugin event API -----------------------------------------
+
+    accepts_plugin_events = True
+    accepts_sample_timestamp = True  # the sampler passes unwind-start time to collect()
+
+    def _add_panel(self, plugin_id, panel):
+        if not plugin_id or panel is None or plugin_id in self.telemetry_panels:
+            return
+        self.telemetry_panels[plugin_id] = panel
+        self.telemetry_plugin_order.append(plugin_id)
+
+    def collect_plugin_event(self, plugin_id, event_type, payload):
+        panel = self.telemetry_panels.get(plugin_id)
+        if panel is None:
+            # Events from a plugin that was not named on the command line
+            # (a replayed sidecar, for example): give it a panel if we can.
+            plugin = make_plugin(plugin_id)
+            if plugin is not None:
+                self._add_panel(plugin_id, plugin.create_panel())
+            panel = self.telemetry_panels.get(plugin_id)
+        if panel is not None:
+            panel.ingest(event_type, payload)
+
+    def telemetry_panel_height(self, height):
+        """Lines of the telemetry area, title included, for a terminal of ``height`` rows.
+
+        ``TELEMETRY_PANEL_HEIGHT`` or a third of the terminal, whichever is
+        more, so tall terminals show more plugin rows while the CPU table
+        keeps two thirds. On a terminal too short for that, the area shrinks
+        so the header, ``MIN_STATS_LINES_WITH_TELEMETRY`` CPU rows and the
+        footer stay on screen, down to ``TELEMETRY_PANEL_MIN_HEIGHT``.
+        """
+        wanted = max(TELEMETRY_PANEL_HEIGHT, height // 3)
+        extra_header_lines = FINISHED_BANNER_EXTRA_LINES if self.finished else 0
+        room = (height - HEADER_LINES - extra_header_lines - FOOTER_LINES
+                - SAFETY_MARGIN - MIN_STATS_LINES_WITH_TELEMETRY)
+        return max(TELEMETRY_PANEL_MIN_HEIGHT, min(wanted, room))
+
+    def _get_current_telemetry_plugin(self):
+        if not self.telemetry_plugin_order:
+            return None, None
+        idx = self.current_telemetry_plugin_idx % len(self.telemetry_plugin_order)
+        plugin_id = self.telemetry_plugin_order[idx]
+        return plugin_id, self.telemetry_panels.get(plugin_id)
+
+    def _cycle_telemetry_mode(self):
+        _, panel = self._get_current_telemetry_plugin()
+        if panel is None:
+            return
+        modes = list(panel.panel_modes) or ["default"]
+        self.current_telemetry_mode_idx = (self.current_telemetry_mode_idx + 1) % len(modes)
+
+    def _cycle_telemetry_plugin(self):
+        if not self.telemetry_plugin_order:
+            return
+        self.current_telemetry_plugin_idx = (
+            (self.current_telemetry_plugin_idx + 1) % len(self.telemetry_plugin_order))
+        self.current_telemetry_mode_idx = 0
